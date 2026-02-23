@@ -1,7 +1,6 @@
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
 import '../engine/PixelEngine.dart';
 
 class BasicScreen extends StatefulWidget {
@@ -14,17 +13,11 @@ class BasicScreen extends StatefulWidget {
 class _BasicScreenState extends State<BasicScreen> {
   final PixelEngine pixelEngine = PixelEngine();
   Uint8List? imageBytes;
-
   Color selectedColor = Colors.red;
 
   final List<Color> paletteColors = [
-    Colors.red,
-    Colors.green,
-    Colors.blue,
-    Colors.yellow,
-    Colors.orange,
-    Colors.purple,
-    Colors.black,
+    Colors.red, Colors.green, Colors.blue, Colors.yellow,
+    Colors.orange, Colors.purple, Colors.black,
   ];
 
   @override
@@ -35,10 +28,9 @@ class _BasicScreenState extends State<BasicScreen> {
 
   Future<void> loadImage() async {
     print('🟢 Loading asset image...');
-    final data = await rootBundle.load('assets/images/mandala-thick.png');
+    final data = await rootBundle.load('assets/images/doremon.png');
     final bytes = data.buffer.asUint8List();
 
-    pixelEngine.loadImage(bytes);
     pixelEngine.loadImage(bytes);
 
     setState(() {
@@ -55,27 +47,51 @@ class _BasicScreenState extends State<BasicScreen> {
     }
 
     final RenderBox box = context.findRenderObject() as RenderBox;
-    final localPos = box.globalToLocal(details.globalPosition);
+    final Size size = box.size;
 
-    final imageWidth = box.size.width;
-    final imageHeight = box.size.height;
+    // --- NEW: LOGIC TO REMOVE EMPTY SPACE (LETTERBOXING) ---
+    double imageAspectRatio = pixelEngine.imageWidth / pixelEngine.imageHeight;
+    double screenAspectRatio = size.width / size.height;
 
-    final scaleX = pixelEngine.imageWidth / imageWidth;
-    final scaleY = pixelEngine.imageHeight / imageHeight;
+    double actualDisplayedWidth, actualDisplayedHeight;
+    double offsetX = 0, offsetY = 0;
 
-    final x = (localPos.dx * scaleX).toInt();
-    final y = (localPos.dy * scaleY).toInt();
+    if (screenAspectRatio > imageAspectRatio) {
+      // Screen is wider than image (bars on left/right)
+      actualDisplayedHeight = size.height;
+      actualDisplayedWidth = size.height * imageAspectRatio;
+      offsetX = (size.width - actualDisplayedWidth) / 2;
+    } else {
+      // Screen is taller than image (bars on top/bottom)
+      actualDisplayedWidth = size.width;
+      actualDisplayedHeight = size.width / imageAspectRatio;
+      offsetY = (size.height - actualDisplayedHeight) / 2;
+    }
 
-    print('🟡 Tap UI → (${localPos.dx.toInt()}, ${localPos.dy.toInt()})');
+    // Adjust tap position based on the offset
+    final double relativeX = details.localPosition.dx - offsetX;
+    final double relativeY = details.localPosition.dy - offsetY;
+
+    // Scale to pixel coordinates
+    final int x = (relativeX * (pixelEngine.imageWidth / actualDisplayedWidth)).toInt();
+    final int y = (relativeY * (pixelEngine.imageHeight / actualDisplayedHeight)).toInt();
+
+    print('🟡 Tap UI → (${details.localPosition.dx.toInt()}, ${details.localPosition.dy.toInt()})');
+    print('🟡 Offset → (X: ${offsetX.toInt()}, Y: ${offsetY.toInt()})');
     print('🟡 Mapped Pixel → ($x, $y)');
     print('🟡 Selected Color → $selectedColor');
 
-    pixelEngine.floodFill(x, y, selectedColor);
+    // Only process if the tap is inside the image bounds
+    if (x >= 0 && x < pixelEngine.imageWidth && y >= 0 && y < pixelEngine.imageHeight) {
+      pixelEngine.floodFill(x, y, selectedColor);
 
-    setState(() {
-      imageBytes = pixelEngine.exportImage();
-      print('🔄 UI setState called → bytes length: ${imageBytes!.length}');
-    });
+      setState(() {
+        imageBytes = pixelEngine.exportImage();
+        print('🔄 UI setState called → bytes length: ${imageBytes!.length}');
+      });
+    } else {
+      print('🟠 Tap outside image boundaries');
+    }
   }
 
   @override
@@ -87,19 +103,19 @@ class _BasicScreenState extends State<BasicScreen> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Coloring App'),centerTitle: true,),
+      appBar: AppBar(title: const Text('Coloring App'), centerTitle: true),
       body: Column(
         children: [
           Expanded(
             child: Center(
               child: GestureDetector(
-                onTapDown: (d) => onTapDown(d, context),
-                child: Image.memory(
-                  imageBytes!,
-                  key: ValueKey(imageBytes!.length), // 🔥 Uses data length as key to force refresh
-                  gaplessPlayback: true, // 🔥 Prevents white flash during update
-                  fit: BoxFit.contain,
-                )
+                  onTapDown: (d) => onTapDown(d, context),
+                  child: Image.memory(
+                    imageBytes!,
+                    key: ValueKey(imageBytes!.length),
+                    gaplessPlayback: true,
+                    fit: BoxFit.contain,
+                  )
               ),
             ),
           ),
@@ -122,9 +138,7 @@ class _BasicScreenState extends State<BasicScreen> {
                       color: c,
                       shape: BoxShape.circle,
                       border: Border.all(
-                        color: c == selectedColor
-                            ? Colors.white
-                            : Colors.transparent,
+                        color: c == selectedColor ? Colors.white : Colors.transparent,
                         width: 4,
                       ),
                     ),

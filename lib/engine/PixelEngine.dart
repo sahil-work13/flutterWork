@@ -12,14 +12,21 @@ class PixelEngine {
   int get imageWidth => _image?.width ?? 0;
   int get imageHeight => _image?.height ?? 0;
 
-  static const int _tolerance = 15;
+  static const int _tolerance = 20;
 
   void loadImage(Uint8List bytes) {
     _image = img.decodeImage(bytes);
     _isLoaded = _image != null;
   }
 
-  bool _isSimilar(int a, int b) => (a - b).abs() <= _tolerance;
+  bool _isSimilar(int pixel, int sR, int sG, int sB) {
+    final pr = img.getRed(pixel);
+    final pg = img.getGreen(pixel);
+    final pb = img.getBlue(pixel);
+    return (pr - sR).abs() <= _tolerance &&
+        (pg - sG).abs() <= _tolerance &&
+        (pb - sB).abs() <= _tolerance;
+  }
 
   void floodFill(int x, int y, material.Color fillColor) {
     if (!_isLoaded || _image == null) return;
@@ -29,20 +36,21 @@ class PixelEngine {
     final int sG = img.getGreen(startPixel);
     final int sB = img.getBlue(startPixel);
 
-    // Border protection: Stop if clicking near-black lines
-    if (sR < 60 && sG < 60 && sB < 60) return;
+    // Stop if hitting dark lines/borders
+    if (sR < 65 && sG < 65 && sB < 65) return;
+    if (sR == fillColor.red && sG == fillColor.green && sB == fillColor.blue) return;
 
     final Queue<Point<int>> queue = Queue()..add(Point(x, y));
+    final int w = _image!.width;
+    final int h = _image!.height;
 
     while (queue.isNotEmpty) {
       final p = queue.removeFirst();
-      if (p.x < 0 || p.y < 0 || p.x >= _image!.width || p.y >= _image!.height) continue;
+      if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
 
       final int current = _image!.getPixel(p.x, p.y);
-      if (_isSimilar(img.getRed(current), sR) &&
-          _isSimilar(img.getGreen(current), sG) &&
-          _isSimilar(img.getBlue(current), sB)) {
-
+      if (_isSimilar(current, sR, sG, sB)) {
+        // Prevent color "leaking" through thin lines
         if (!(img.getRed(current) < 60 && img.getGreen(current) < 60 && img.getBlue(current) < 60)) {
           _image!.setPixelRgba(p.x, p.y, fillColor.red, fillColor.green, fillColor.blue, 255);
           queue.add(Point(p.x + 1, p.y));

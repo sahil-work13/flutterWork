@@ -8,24 +8,18 @@ class PixelEngine {
   img.Image? _image;
   bool _isLoaded = false;
 
+  static const int _tolerance = 30;
+
   bool get isLoaded => _isLoaded;
   int get imageWidth => _image?.width ?? 0;
   int get imageHeight => _image?.height ?? 0;
 
-  static const int _tolerance = 20;
-
   void loadImage(Uint8List bytes) {
     _image = img.decodeImage(bytes);
     _isLoaded = _image != null;
-  }
-
-  bool _isSimilar(int pixel, int sR, int sG, int sB) {
-    final pr = img.getRed(pixel);
-    final pg = img.getGreen(pixel);
-    final pb = img.getBlue(pixel);
-    return (pr - sR).abs() <= _tolerance &&
-        (pg - sG).abs() <= _tolerance &&
-        (pb - sB).abs() <= _tolerance;
+    if (_isLoaded) {
+      print('ENGINE: Image loaded successfully. Size: ${imageWidth}x${imageHeight}');
+    }
   }
 
   void floodFill(int x, int y, material.Color fillColor) {
@@ -36,30 +30,52 @@ class PixelEngine {
     final int sG = img.getGreen(startPixel);
     final int sB = img.getBlue(startPixel);
 
-    // Stop if hitting dark lines/borders
-    if (sR < 65 && sG < 65 && sB < 65) return;
-    if (sR == fillColor.red && sG == fillColor.green && sB == fillColor.blue) return;
+    print('ENGINE: Start Fill at ($x, $y) | Target RGB: ($sR, $sG, $sB)');
 
-    final Queue<Point<int>> queue = Queue()..add(Point(x, y));
+    // Block if clicking on a black border (RGB < 60)
+    if (sR < 60 && sG < 60 && sB < 60) {
+      print('ENGINE: Canceled - Touched a black border.');
+      return;
+    }
+
+    // Prevent re-filling same color
+    if (sR == fillColor.red && sG == fillColor.green && sB == fillColor.blue) {
+      print('ENGINE: Canceled - Area already matches selected color.');
+      return;
+    }
+
     final int w = _image!.width;
     final int h = _image!.height;
+    final Uint8List visited = Uint8List(w * h);
+    final Queue<Point<int>> queue = Queue()..add(Point(x, y));
+    int filledCount = 0;
 
     while (queue.isNotEmpty) {
       final p = queue.removeFirst();
       if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
 
+      final int index = p.y * w + p.x;
+      if (visited[index] == 1) continue;
+      visited[index] = 1;
+
       final int current = _image!.getPixel(p.x, p.y);
       if (_isSimilar(current, sR, sG, sB)) {
-        // Prevent color "leaking" through thin lines
-        if (!(img.getRed(current) < 60 && img.getGreen(current) < 60 && img.getBlue(current) < 60)) {
-          _image!.setPixelRgba(p.x, p.y, fillColor.red, fillColor.green, fillColor.blue, 255);
-          queue.add(Point(p.x + 1, p.y));
-          queue.add(Point(p.x - 1, p.y));
-          queue.add(Point(p.x, p.y + 1));
-          queue.add(Point(p.x, p.y - 1));
-        }
+        _image!.setPixelRgba(p.x, p.y, fillColor.red, fillColor.green, fillColor.blue, 255);
+        filledCount++;
+
+        queue.add(Point(p.x + 1, p.y));
+        queue.add(Point(p.x - 1, p.y));
+        queue.add(Point(p.x, p.y + 1));
+        queue.add(Point(p.x, p.y - 1));
       }
     }
+    print('ENGINE: Fill completed. Total pixels updated: $filledCount');
+  }
+
+  bool _isSimilar(int pixel, int sR, int sG, int sB) {
+    return (img.getRed(pixel) - sR).abs() <= _tolerance &&
+        (img.getGreen(pixel) - sG).abs() <= _tolerance &&
+        (img.getBlue(pixel) - sB).abs() <= _tolerance;
   }
 
   Uint8List exportImage() => Uint8List.fromList(img.encodePng(_image!));

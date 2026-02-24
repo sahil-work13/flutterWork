@@ -16,17 +16,19 @@ class _BasicScreenState extends State<BasicScreen> {
   final PixelEngine pixelEngine = PixelEngine();
   Uint8List? imageBytes;
   Color selectedColor = Colors.amber;
-
-  // Single controller for Zoom and Pan
   final TransformationController _transformationController = TransformationController();
 
-  List<Color> colorHistory = [Colors.red, Colors.blue, Colors.green, Colors.black];
+  final List<Color> colorHistory = [
+    Colors.red, Colors.blue, Colors.green, Colors.black,
+    Colors.yellow, Colors.orange, Colors.purple, Colors.pink
+  ];
+
   final List<String> testImages = [
     'assets/images/doremon.png',
     'assets/images/shinchan.png',
     'assets/images/mandala.png',
-    'assets/images/mandala-thick.png',
     'assets/images/smilie.png',
+    'assets/images/mandala-thick.png',
   ];
   int currentImageIndex = 0;
 
@@ -34,12 +36,6 @@ class _BasicScreenState extends State<BasicScreen> {
   void initState() {
     super.initState();
     loadImage();
-  }
-
-  @override
-  void dispose() {
-    _transformationController.dispose();
-    super.dispose();
   }
 
   Future<void> loadImage() async {
@@ -51,175 +47,174 @@ class _BasicScreenState extends State<BasicScreen> {
         imageBytes = bytes;
         _transformationController.value = Matrix4.identity();
       });
+      debugPrint('UI: Loaded image ${testImages[currentImageIndex]}');
     } catch (e) {
-      debugPrint('Error: $e');
+      debugPrint('UI: Load Error: $e');
     }
   }
 
   void handleTap(TapDownDetails details, Size containerSize) {
     if (!pixelEngine.isLoaded || imageBytes == null) return;
 
-    // 1. Get the local tap position
-    final Offset localOffset = details.localPosition;
+    debugPrint('--- TAP DEBUG START ---');
+    debugPrint('Screen Touch: ${details.localPosition}');
 
-    // 2. High-Precision Inverse Transformation
-    // This maps the tap back to the image plane regardless of Zoom or Pan
+    // 1. Convert Screen Touch to Zoomed Coordinate
     final Matrix4 transform = _transformationController.value;
     final Matrix4 inverse = Matrix4.inverted(transform);
-    final Vector3 untransformed = inverse.transform3(Vector3(localOffset.dx, localOffset.dy, 0));
-    final Offset sceneOffset = Offset(untransformed.x, untransformed.y);
+    final Vector3 untransformed = inverse.transform3(Vector3(details.localPosition.dx, details.localPosition.dy, 0));
 
+    debugPrint('Zoom Level: ${transform.getMaxScaleOnAxis()}');
+    debugPrint('Coordinate after Zoom-Correction: (${untransformed.x}, ${untransformed.y})');
+
+    // 2. Map Coordinate to Image Pixels
     double imgW = pixelEngine.imageWidth.toDouble();
     double imgH = pixelEngine.imageHeight.toDouble();
     double viewW = containerSize.width;
     double viewH = containerSize.height;
 
-    // 3. Scale and Offset (BoxFit.contain logic)
     double scaleFit = (viewW / imgW < viewH / imgH) ? (viewW / imgW) : (viewH / imgH);
     double offsetX = (viewW - (imgW * scaleFit)) / 2.0;
     double offsetY = (viewH - (imgH * scaleFit)) / 2.0;
 
-    // 4. Final Pixel Indexing with Epsilon for accuracy
-    int pixelX = ((sceneOffset.dx - offsetX) / scaleFit + 0.0001).floor();
-    int pixelY = ((sceneOffset.dy - offsetY) / scaleFit + 0.0001).floor();
+    int pixelX = ((untransformed.x - offsetX) / scaleFit).round();
+    int pixelY = ((untransformed.y - offsetY) / scaleFit).round();
 
-    print('--- ZOOM DEBUG ---');
-    print('Scale: ${transform.getMaxScaleOnAxis().toStringAsFixed(2)}x');
-    print('Pixel: ($pixelX, $pixelY)');
+    debugPrint('Scaling Math: FitScale=$scaleFit, OffsetX=$offsetX, OffsetY=$offsetY');
+    debugPrint('TARGET PIXEL: ($pixelX, $pixelY) on ${imgW.toInt()}x${imgH.toInt()} image');
 
     if (pixelX >= 0 && pixelX < imgW && pixelY >= 0 && pixelY < imgH) {
       pixelEngine.floodFill(pixelX, pixelY, selectedColor);
       setState(() {
         imageBytes = pixelEngine.exportImage();
       });
+    } else {
+      debugPrint('TAP OUTSIDE IMAGE BOUNDS');
     }
+    debugPrint('--- TAP DEBUG END ---');
   }
-
-  @override
-  // ... (imports remain the same)
-
-// Inside _BasicScreenState class ...
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.white,
       appBar: AppBar(
-        title: Text('Coloring Image ${currentImageIndex + 1}'),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios),
-          onPressed: () {
-            setState(() => currentImageIndex = (currentImageIndex - 1 + testImages.length) % testImages.length);
-            loadImage();
-          },
-        ),
+        title: Text('Art ${currentImageIndex + 1}'),
+        centerTitle: true,
         actions: [
-          IconButton(
-            icon: const Icon(Icons.arrow_forward_ios),
-            onPressed: () {
-              setState(() => currentImageIndex = (currentImageIndex + 1) % testImages.length);
-              loadImage();
-            },
-          ),
-          IconButton(
-            icon: Icon(Icons.palette, color: selectedColor),
-            onPressed: showPicker,
-          ),
+          IconButton(icon: const Icon(Icons.refresh), onPressed: loadImage),
+          IconButton(icon: Icon(Icons.palette, color: selectedColor), onPressed: showPicker),
         ],
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: imageBytes == null
-                ? const Center(child: CircularProgressIndicator())
-                : LayoutBuilder(
-              builder: (context, constraints) {
-                final size = Size(constraints.maxWidth, constraints.maxHeight);
-                return InteractiveViewer(
-                  transformationController: _transformationController,
-                  // DISABLING SCROLL/PAN HERE
-                  panEnabled: false,
-                  scaleEnabled: true,
-                  minScale: 1.0,
-                  maxScale: 15.0,
-                  // Remove boundary margin to keep the image locked in place
-                  boundaryMargin: EdgeInsets.zero,
-                  child: GestureDetector(
-                    onTapDown: (details) => handleTap(details, size),
-                    behavior: HitTestBehavior.opaque,
-                    child: Center(
-                      child: Image.memory(
-                        imageBytes!,
-                        key: ValueKey('img_${currentImageIndex}_${imageBytes!.length}'),
-                        fit: BoxFit.contain,
-                        gaplessPlayback: true,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey.shade300),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: imageBytes == null
+                      ? const Center(child: CircularProgressIndicator())
+                      : LayoutBuilder(
+                    builder: (context, constraints) {
+                      return InteractiveViewer(
+                        transformationController: _transformationController,
+                        panEnabled: true,
+                        minScale: 1.0,
+                        maxScale: 8.0,
+                        child: GestureDetector(
+                          onTapDown: (details) => handleTap(details, Size(constraints.maxWidth, constraints.maxHeight)),
+                          behavior: HitTestBehavior.opaque,
+                          child: Center(
+                            child: Image.memory(
+                              imageBytes!,
+                              key: ValueKey('img_${currentImageIndex}_${imageBytes!.length}'),
+                              fit: BoxFit.contain,
+                              gaplessPlayback: true,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+
+            Container(
+              height: 140,
+              padding: const EdgeInsets.only(top: 15, bottom: 25),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      ElevatedButton(
+                        onPressed: () {
+                          setState(() => currentImageIndex = (currentImageIndex - 1 + testImages.length) % testImages.length);
+                          loadImage();
+                        },
+                        child: const Icon(Icons.chevron_left),
+                      ),
+                      const Text("PICK A COLOR", style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+                      ElevatedButton(
+                        onPressed: () {
+                          setState(() => currentImageIndex = (currentImageIndex + 1) % testImages.length);
+                          loadImage();
+                        },
+                        child: const Icon(Icons.chevron_right),
+                      ),
+                    ],
+                  ),
+                  const Spacer(),
+                  SizedBox(
+                    height: 50,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      itemCount: colorHistory.length,
+                      itemBuilder: (context, i) => GestureDetector(
+                        onTap: () => setState(() => selectedColor = colorHistory[i]),
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(horizontal: 8),
+                          width: 45,
+                          decoration: BoxDecoration(
+                            color: colorHistory[i],
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: selectedColor == colorHistory[i] ? Colors.blue : Colors.grey.shade300,
+                              width: 3,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ),
-                );
-              },
+                ],
+              ),
             ),
-          ),
-          _buildBottomBar(),
-        ],
+          ],
+        ),
       ),
     );
   }
-
-// ... (remaining methods handleTap, showPicker, _buildBottomBar remain the same)
 
   void showPicker() {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Pick a Color'),
         content: SingleChildScrollView(
           child: ColorPicker(
             pickerColor: selectedColor,
             onColorChanged: (c) => setState(() => selectedColor = c),
           ),
         ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildBottomBar() {
-    return Container(
-      height: 80,
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      color: Colors.white,
-      child: Row(
-        children: [
-          IconButton(
-            icon: const Icon(Icons.colorize, size: 30),
-            onPressed: showPicker,
-          ),
-          Expanded(
-            child: ListView.builder(
-              scrollDirection: Axis.horizontal,
-              itemCount: colorHistory.length,
-              itemBuilder: (context, index) {
-                return GestureDetector(
-                  onTap: () => setState(() => selectedColor = colorHistory[index]),
-                  child: Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 5),
-                    width: 45,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: colorHistory[index],
-                      border: Border.all(
-                        color: selectedColor == colorHistory[index] ? Colors.black : Colors.transparent,
-                        width: 3,
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
       ),
     );
   }

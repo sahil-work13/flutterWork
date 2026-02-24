@@ -1,104 +1,50 @@
 import 'dart:typed_data';
-import 'dart:ui' as ui;
 import 'package:image/image.dart' as img;
 import 'dart:collection';
 import 'dart:math';
+import 'package:flutter/material.dart' as material;
 
 class PixelEngine {
-  late img.Image _image;
+  img.Image? _image;
   bool _isLoaded = false;
 
   bool get isLoaded => _isLoaded;
-  int get imageWidth => _image.width;
-  int get imageHeight => _image.height;
+  int get imageWidth => _image?.width ?? 0;
+  int get imageHeight => _image?.height ?? 0;
 
-  static const int _tolerance = 15; // Adjusted for better detail catching
+  static const int _tolerance = 15;
 
   void loadImage(Uint8List bytes) {
-    print('🟢 PixelEngine: Loading image...');
-    _image = img.decodeImage(bytes)!;
-
-    bool hasFilledRegions = false;
-    for (int y = 0; y < _image.height; y += 20) {
-      for (int x = 0; x < _image.width; x += 20) {
-        final p = _image.getPixel(x, y);
-        if (p.r < 10 && p.g < 10 && p.b < 10) {
-          hasFilledRegions = true;
-          break;
-        }
-      }
-      if (hasFilledRegions) break;
-    }
-
-    if (hasFilledRegions) {
-      print('🟢 Filled-shape image detected → skipping preprocessing');
-    } else {
-      print('🟡 Line-art image detected → preprocessing');
-      for (int y = 0; y < _image.height; y++) {
-        for (int x = 0; x < _image.width; x++) {
-          final p = _image.getPixel(x, y);
-          final lum = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b).round();
-          if (lum > 210) {
-            _image.setPixelRgba(x, y, 255, 255, 255, 255);
-          } else {
-            _image.setPixelRgba(x, y, 0, 0, 0, 255);
-          }
-        }
-      }
-    }
-
-    _isLoaded = true;
-    print('🟢 Image ready → ${_image.width} x ${_image.height}');
+    _image = img.decodeImage(bytes);
+    _isLoaded = _image != null;
   }
 
-  bool _isSimilar(num a, num b) {
-    return (a - b).abs() <= _tolerance;
-  }
+  bool _isSimilar(int a, int b) => (a - b).abs() <= _tolerance;
 
-  void floodFill(int x, int y, ui.Color fillColor) {
-    if (!_isLoaded) return;
-    if (x < 0 || y < 0 || x >= _image.width || y >= _image.height) return;
+  void floodFill(int x, int y, material.Color fillColor) {
+    if (!_isLoaded || _image == null) return;
 
-    final startPixel = _image.getPixel(x, y);
+    final int startPixel = _image!.getPixel(x, y);
+    final int sR = img.getRed(startPixel);
+    final int sG = img.getGreen(startPixel);
+    final int sB = img.getBlue(startPixel);
 
-    // 🛑 NEW: Protection logic - Don't fill if user hits a black border
-    if (startPixel.r < 50 && startPixel.g < 50 && startPixel.b < 50) {
-      print('🟠 Tap ignored: You hit a black line/border.');
-      return;
-    }
+    // Border protection: Stop if clicking near-black lines
+    if (sR < 60 && sG < 60 && sB < 60) return;
 
-    // LOGS PRESERVED
-    print('🟡 FloodFill requested at ($x, $y)');
-    print('🟡 Start Pixel RGBA → ${startPixel.r}, ${startPixel.g}, ${startPixel.b}, ${startPixel.a}');
-
-    final int targetR = startPixel.r.toInt();
-    final int targetG = startPixel.g.toInt();
-    final int targetB = startPixel.b.toInt();
-
-    if (targetR == fillColor.red && targetG == fillColor.green && targetB == fillColor.blue) return;
-
-    final Queue<Point<int>> queue = Queue();
-    queue.add(Point(x, y));
-
-    int pixelsFilled = 0;
+    final Queue<Point<int>> queue = Queue()..add(Point(x, y));
 
     while (queue.isNotEmpty) {
       final p = queue.removeFirst();
+      if (p.x < 0 || p.y < 0 || p.x >= _image!.width || p.y >= _image!.height) continue;
 
-      if (p.x < 0 || p.y < 0 || p.x >= _image.width || p.y >= _image.height) continue;
+      final int current = _image!.getPixel(p.x, p.y);
+      if (_isSimilar(img.getRed(current), sR) &&
+          _isSimilar(img.getGreen(current), sG) &&
+          _isSimilar(img.getBlue(current), sB)) {
 
-      final current = _image.getPixel(p.x, p.y);
-
-      // We fill if pixel is similar to what we tapped AND isn't a black line
-      if (_isSimilar(current.r, targetR) &&
-          _isSimilar(current.g, targetG) &&
-          _isSimilar(current.b, targetB)) {
-
-        // Final check to make sure we aren't bleeding into black lines
-        if (!(current.r < 50 && current.g < 50 && current.b < 50)) {
-          _image.setPixelRgba(p.x, p.y, fillColor.red, fillColor.green, fillColor.blue, 255);
-          pixelsFilled++;
-
+        if (!(img.getRed(current) < 60 && img.getGreen(current) < 60 && img.getBlue(current) < 60)) {
+          _image!.setPixelRgba(p.x, p.y, fillColor.red, fillColor.green, fillColor.blue, 255);
           queue.add(Point(p.x + 1, p.y));
           queue.add(Point(p.x - 1, p.y));
           queue.add(Point(p.x, p.y + 1));
@@ -106,11 +52,7 @@ class PixelEngine {
         }
       }
     }
-    print('🟢 FloodFill complete → $pixelsFilled pixels filled');
   }
 
-  Uint8List exportImage() {
-    print('🟢 Exporting image bytes...');
-    return Uint8List.fromList(img.encodePng(_image));
-  }
+  Uint8List exportImage() => Uint8List.fromList(img.encodePng(_image!));
 }

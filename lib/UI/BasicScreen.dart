@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,7 +8,6 @@ import 'package:image/image.dart' as img;
 import 'package:vector_math/vector_math_64.dart' show Vector3;
 import '../engine/PixelEngine.dart';
 
-// Passed to the encode isolate
 class _EncodeRequest {
   final Uint8List bytes;
   final int width;
@@ -25,12 +25,13 @@ class BasicScreen extends StatefulWidget {
 class _BasicScreenState extends State<BasicScreen> {
   final PixelEngine pixelEngine = PixelEngine();
 
-  // What Image.memory() renders — JPEG encoded
-  Uint8List? imageBytes;
+  // ui.Image is rendered directly by RawImage — no encode/decode for display
+  ui.Image? _uiImage;
 
-  // Raw RGBA pixels from the last fill — passed back to isolate on next fill
-  // so it can skip decodeImage entirely
+  // Raw RGBA bytes cached between fills — isolate skips decodeImage on 2nd+ fills
   Uint8List? _rawFillBytes;
+  // Original PNG bytes — used only for the very first fill
+  Uint8List? _originalBytes;
   int _rawWidth  = 0;
   int _rawHeight = 0;
 
@@ -71,19 +72,29 @@ class _BasicScreenState extends State<BasicScreen> {
     loadImage();
   }
 
+  @override
+  void dispose() {
+    _uiImage?.dispose();
+    super.dispose();
+  }
+
   Future<void> loadImage() async {
     try {
       final ByteData data   = await rootBundle.load(testImages[currentImageIndex]);
       final Uint8List bytes = data.buffer.asUint8List();
+
       pixelEngine.loadImage(bytes);
+      _originalBytes = bytes;
+      _rawFillBytes  = null;
+      _rawWidth      = pixelEngine.imageWidth;
+      _rawHeight     = pixelEngine.imageHeight;
 
-      // Reset raw cache — new image, start fresh
-      _rawFillBytes = null;
-      _rawWidth     = pixelEngine.imageWidth;
-      _rawHeight    = pixelEngine.imageHeight;
+      // Decode to ui.Image for flicker-free display
+      final ui.Image loaded = await _decodeToUiImage(bytes);
 
+      _uiImage?.dispose();
       setState(() {
-        imageBytes = bytes; // display original PNG directly — no re-encode needed
+        _uiImage = loaded;
         _transformationController.value = Matrix4.identity();
       });
       _updateFitCache();
@@ -92,10 +103,35 @@ class _BasicScreenState extends State<BasicScreen> {
     }
   }
 
+  /// Decodes any encoded image bytes (PNG/JPEG) to a ui.Image
+  Future<ui.Image> _decodeToUiImage(Uint8List bytes) async {
+    final ui.Codec codec = await ui.instantiateImageCodec(bytes);
+    final ui.FrameInfo frame = await codec.getNextFrame();
+    codec.dispose();
+    return frame.image;
+  }
+
+  /// Converts raw RGBA bytes directly to ui.Image — no codec, instant
+  Future<ui.Image> _rawRgbaToUiImage(Uint8List rgba, int width, int height) async {
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(rgba);
+    final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
+      buffer,
+      width:           width,
+      height:          height,
+      pixelFormat:     ui.PixelFormat.rgba8888,
+    );
+    final ui.Codec codec = await descriptor.instantiateCodec();
+    final ui.FrameInfo frame = await codec.getNextFrame();
+    codec.dispose();
+    descriptor.dispose();
+    buffer.dispose();
+    return frame.image;
+  }
+
   void _updateFitCache() {
-    if (_containerSize == Size.zero || !pixelEngine.isLoaded) return;
-    final double imgW  = pixelEngine.imageWidth.toDouble();
-    final double imgH  = pixelEngine.imageHeight.toDouble();
+    if (_containerSize == Size.zero || _uiImage == null) return;
+    final double imgW  = _rawWidth.toDouble();
+    final double imgH  = _rawHeight.toDouble();
     final double viewW = _containerSize.width;
     final double viewH = _containerSize.height;
     _cachedScaleFit   = (viewW / imgW < viewH / imgH) ? viewW / imgW : viewH / imgH;
@@ -163,7 +199,7 @@ class _BasicScreenState extends State<BasicScreen> {
   // ── Fill pipeline ──────────────────────────────────────────────────────────
 
   Future<void> handleTap(Offset localOffset) async {
-    if (!pixelEngine.isLoaded || imageBytes == null || isProcessing) return;
+    if (_uiImage == null || isProcessing) return;
 
     final Matrix4 inverse = Matrix4.inverted(_transformationController.value);
     final Vector3 scene   = inverse.transform3(
@@ -175,19 +211,16 @@ class _BasicScreenState extends State<BasicScreen> {
 
     if (pixelX < 0 || pixelX >= _rawWidth || pixelY < 0 || pixelY >= _rawHeight) return;
 
-    setState(() => isProcessing = true);
+    // Lock — no setState here, no UI flicker
+    isProcessing = true;
 
     final bool hasRaw = _rawFillBytes != null;
 
-    // ┌─────────────────────────────────────────────────────────────┐
-    // │  FILL ISOLATE                                               │
-    // │  First fill: decodes PNG once                               │
-    // │  Every fill after: Image.fromBytes (raw RGBA) — near-zero  │
-    // └─────────────────────────────────────────────────────────────┘
+    // BFS fill in background isolate — returns raw RGBA, no encode
     final Uint8List rawResult = await compute(
       PixelEngine.processFloodFill,
       FloodFillRequest(
-        imageBytes:    hasRaw ? _rawFillBytes! : imageBytes!,
+        imageBytes:    hasRaw ? _rawFillBytes! : _originalBytes!,
         x:             pixelX,
         y:             pixelY,
         fillColorRgba: img.getColor(
@@ -199,30 +232,21 @@ class _BasicScreenState extends State<BasicScreen> {
       ),
     );
 
-    // Cache raw result — passed straight back on next tap
+    // Cache raw bytes for next fill
     _rawFillBytes = rawResult;
-
-    // Update engine in-memory image from raw bytes (no decode)
     pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
 
-    // ┌─────────────────────────────────────────────────────────────┐
-    // │  ENCODE ISOLATE                                             │
-    // │  Convert raw RGBA → JPEG for display, off the UI thread     │
-    // └─────────────────────────────────────────────────────────────┘
-    final Uint8List displayBytes = await compute(
-      _encodeToJpeg,
-      _EncodeRequest(rawResult, _rawWidth, _rawHeight),
-    );
+    // Convert raw RGBA → ui.Image directly — no PNG/JPEG encode at all
+    final ui.Image newUiImage = await _rawRgbaToUiImage(rawResult, _rawWidth, _rawHeight);
 
+    // Swap old image for new — single setState, no intermediate blank frame
+    final ui.Image? oldImage = _uiImage;
     setState(() {
-      imageBytes   = displayBytes;
+      _uiImage     = newUiImage;
       isProcessing = false;
     });
-  }
-
-  static Uint8List _encodeToJpeg(_EncodeRequest req) {
-    final img.Image image = img.Image.fromBytes(req.width, req.height, req.bytes);
-    return Uint8List.fromList(img.encodeJpg(image, quality: 90));
+    // Dispose old image AFTER setState so it's never disposed while being rendered
+    oldImage?.dispose();
   }
 
   // ── Build ──────────────────────────────────────────────────────────────────
@@ -239,6 +263,7 @@ class _BasicScreenState extends State<BasicScreen> {
           style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
         ),
         centerTitle: true,
+        // Subtle indicator — no full-screen loader
         leading: isProcessing
             ? const Padding(
           padding: EdgeInsets.all(15),
@@ -267,12 +292,11 @@ class _BasicScreenState extends State<BasicScreen> {
                   ),
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(24),
-                    child: imageBytes == null
+                    child: _uiImage == null
                         ? const Center(child: CircularProgressIndicator())
                         : LayoutBuilder(
                       builder: (context, constraints) {
-                        final Size newSize =
-                        Size(constraints.maxWidth, constraints.maxHeight);
+                        final Size newSize = Size(constraints.maxWidth, constraints.maxHeight);
                         if (_containerSize != newSize) {
                           _containerSize = newSize;
                           _updateFitCache();
@@ -292,11 +316,12 @@ class _BasicScreenState extends State<BasicScreen> {
                               width:  constraints.maxWidth,
                               height: constraints.maxHeight,
                               child: Center(
-                                child: Image.memory(
-                                  imageBytes!,
-                                  key:             ValueKey(imageBytes.hashCode),
-                                  fit:             BoxFit.contain,
-                                  gaplessPlayback: true,
+                                // RawImage renders ui.Image directly on the GPU
+                                // No encode → decode cycle, no widget rebuild flicker
+                                child: RawImage(
+                                  image:    _uiImage,
+                                  fit:      BoxFit.contain,
+                                  filterQuality: FilterQuality.medium,
                                 ),
                               ),
                             ),

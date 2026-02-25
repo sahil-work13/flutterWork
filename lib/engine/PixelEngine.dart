@@ -4,11 +4,28 @@ import 'dart:collection';
 import 'dart:math';
 import 'package:flutter/material.dart' as material;
 
+/// Data class to pass data to the background Isolate
+class FloodFillRequest {
+  final Uint8List imageBytes;
+  final int x;
+  final int y;
+  final int fillColorRgba;
+
+  FloodFillRequest({
+    required this.imageBytes,
+    required this.x,
+    required this.y,
+    required this.fillColorRgba,
+  });
+}
+
 class PixelEngine {
   img.Image? _image;
+  img.Image? _originalImage;
   bool _isLoaded = false;
 
-  static const int _tolerance = 30;
+  static const int _tolerance = 35;
+  static const int _borderThreshold = 60;
 
   bool get isLoaded => _isLoaded;
   int get imageWidth => _image?.width ?? 0;
@@ -16,52 +33,71 @@ class PixelEngine {
 
   void loadImage(Uint8List bytes) {
     _image = img.decodeImage(bytes);
+    _originalImage = img.decodeImage(bytes);
     _isLoaded = _image != null;
-    if (_isLoaded) {
-      print('ENGINE: Image loaded successfully. Size: ${imageWidth}x${imageHeight}');
-    }
   }
 
+  // Added back to prevent 'undefined_method' errors in backup files
   void floodFill(int x, int y, material.Color fillColor) {
-    if (!_isLoaded || _image == null) return;
+    // This is now a placeholder or can be used for non-async fills
+    material.debugPrint("Use compute(PixelEngine.processFloodFill, request) for better performance");
+  }
 
-    final int startPixel = _image!.getPixel(x, y);
-    final int sR = img.getRed(startPixel);
-    final int sG = img.getGreen(startPixel);
-    final int sB = img.getBlue(startPixel);
+  static Uint8List processFloodFill(FloodFillRequest request) {
+    final img.Image? currentImage = img.decodeImage(request.imageBytes);
+    final img.Image? maskImage = img.decodeImage(request.imageBytes);
 
-    print('ENGINE: Start Fill at ($x, $y) | Target RGB: ($sR, $sG, $sB)');
+    if (currentImage == null || maskImage == null) return request.imageBytes;
 
-    // Block if clicking on a black border (RGB < 60)
-    if (sR < 60 && sG < 60 && sB < 60) {
-      print('ENGINE: Canceled - Touched a black border.');
-      return;
+    int x = request.x;
+    int y = request.y;
+
+    bool isBorder(int px, int py) {
+      if (px < 0 || px >= currentImage.width || py < 0 || py >= currentImage.height) return true;
+      final int p = maskImage.getPixel(px, py);
+      return img.getRed(p) < _borderThreshold &&
+          img.getGreen(p) < _borderThreshold &&
+          img.getBlue(p) < _borderThreshold;
     }
 
-    // Prevent re-filling same color
-    if (sR == fillColor.red && sG == fillColor.green && sB == fillColor.blue) {
-      print('ENGINE: Canceled - Area already matches selected color.');
-      return;
+    if (isBorder(x, y)) {
+      bool found = false;
+      for (int i = -2; i <= 2 && !found; i++) {
+        for (int j = -2; j <= 2 && !found; j++) {
+          if (!isBorder(x + i, y + j)) {
+            x += i; y += j;
+            found = true;
+          }
+        }
+      }
+      if (!found) return request.imageBytes;
     }
 
-    final int w = _image!.width;
-    final int h = _image!.height;
+    final int startPixel = currentImage.getPixel(x, y);
+    final int sR = img.getRed(startPixel), sG = img.getGreen(startPixel), sB = img.getBlue(startPixel);
+
+    if (startPixel == request.fillColorRgba) return request.imageBytes;
+
+    final int w = currentImage.width, h = currentImage.height;
     final Uint8List visited = Uint8List(w * h);
     final Queue<Point<int>> queue = Queue()..add(Point(x, y));
-    int filledCount = 0;
 
     while (queue.isNotEmpty) {
       final p = queue.removeFirst();
       if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
 
-      final int index = p.y * w + p.x;
-      if (visited[index] == 1) continue;
-      visited[index] = 1;
+      final int idx = p.y * w + p.x;
+      if (visited[idx] == 1) continue;
+      visited[idx] = 1;
 
-      final int current = _image!.getPixel(p.x, p.y);
-      if (_isSimilar(current, sR, sG, sB)) {
-        _image!.setPixelRgba(p.x, p.y, fillColor.red, fillColor.green, fillColor.blue, 255);
-        filledCount++;
+      if (isBorder(p.x, p.y)) continue;
+
+      final int current = currentImage.getPixel(p.x, p.y);
+      if ((img.getRed(current) - sR).abs() <= _tolerance &&
+          (img.getGreen(current) - sG).abs() <= _tolerance &&
+          (img.getBlue(current) - sB).abs() <= _tolerance) {
+
+        currentImage.setPixel(p.x, p.y, request.fillColorRgba);
 
         queue.add(Point(p.x + 1, p.y));
         queue.add(Point(p.x - 1, p.y));
@@ -69,13 +105,7 @@ class PixelEngine {
         queue.add(Point(p.x, p.y - 1));
       }
     }
-    print('ENGINE: Fill completed. Total pixels updated: $filledCount');
-  }
-
-  bool _isSimilar(int pixel, int sR, int sG, int sB) {
-    return (img.getRed(pixel) - sR).abs() <= _tolerance &&
-        (img.getGreen(pixel) - sG).abs() <= _tolerance &&
-        (img.getBlue(pixel) - sB).abs() <= _tolerance;
+    return Uint8List.fromList(img.encodePng(currentImage));
   }
 
   Uint8List exportImage() => Uint8List.fromList(img.encodePng(_image!));

@@ -7,6 +7,14 @@ import 'package:image/image.dart' as img;
 import 'package:vector_math/vector_math_64.dart' show Vector3;
 import '../engine/PixelEngine.dart';
 
+// Passed to the encode isolate
+class _EncodeRequest {
+  final Uint8List bytes;
+  final int width;
+  final int height;
+  _EncodeRequest(this.bytes, this.width, this.height);
+}
+
 class BasicScreen extends StatefulWidget {
   const BasicScreen({super.key});
 
@@ -16,22 +24,32 @@ class BasicScreen extends StatefulWidget {
 
 class _BasicScreenState extends State<BasicScreen> {
   final PixelEngine pixelEngine = PixelEngine();
+
+  // What Image.memory() renders — JPEG encoded
   Uint8List? imageBytes;
-  Color selectedColor = const Color(0xFFFFC107);
-  bool isProcessing = false;
-  int currentImageIndex = 0;
+
+  // Raw RGBA pixels from the last fill — passed back to isolate on next fill
+  // so it can skip decodeImage entirely
+  Uint8List? _rawFillBytes;
+  int _rawWidth  = 0;
+  int _rawHeight = 0;
+
+  Color selectedColor     = const Color(0xFFFFC107);
+  bool  isProcessing      = false;
+  int   currentImageIndex = 0;
   final TransformationController _transformationController = TransformationController();
 
-  // Container size stored for tap coordinate math
-  Size _containerSize = Size.zero;
+  Size   _containerSize    = Size.zero;
+  double _cachedScaleFit   = 1.0;
+  double _cachedFitOffsetX = 0.0;
+  double _cachedFitOffsetY = 0.0;
 
-  // Tap detection — tracks pointer events to distinguish tap vs pan/pinch
-  int _activePointers = 0;
+  int     _activePointers    = 0;
   Offset? _pointerDownPosition;
-  int _pointerDownTimeMs = 0;
-  bool _pointerDragged = false;
-  static const double _tapMoveThreshold = 10.0; // px — beyond this = drag, not tap
-  static const int _tapMaxDurationMs = 250;      // ms — beyond this = long-press, not tap
+  int     _pointerDownTimeMs = 0;
+  bool    _pointerDragged    = false;
+  static const double _tapMoveThreshold = 10.0;
+  static const int    _tapMaxDurationMs = 250;
 
   final List<Color> colorHistory = [
     const Color(0xFFF44336), const Color(0xFFE91E63), const Color(0xFF9C27B0),
@@ -55,23 +73,41 @@ class _BasicScreenState extends State<BasicScreen> {
 
   Future<void> loadImage() async {
     try {
-      final data = await rootBundle.load(testImages[currentImageIndex]);
-      final bytes = data.buffer.asUint8List();
+      final ByteData data   = await rootBundle.load(testImages[currentImageIndex]);
+      final Uint8List bytes = data.buffer.asUint8List();
       pixelEngine.loadImage(bytes);
+
+      // Reset raw cache — new image, start fresh
+      _rawFillBytes = null;
+      _rawWidth     = pixelEngine.imageWidth;
+      _rawHeight    = pixelEngine.imageHeight;
+
       setState(() {
-        imageBytes = bytes;
+        imageBytes = bytes; // display original PNG directly — no re-encode needed
         _transformationController.value = Matrix4.identity();
       });
+      _updateFitCache();
     } catch (e) {
-      debugPrint('UI: Load Error: $e');
+      debugPrint('Load error: $e');
     }
+  }
+
+  void _updateFitCache() {
+    if (_containerSize == Size.zero || !pixelEngine.isLoaded) return;
+    final double imgW  = pixelEngine.imageWidth.toDouble();
+    final double imgH  = pixelEngine.imageHeight.toDouble();
+    final double viewW = _containerSize.width;
+    final double viewH = _containerSize.height;
+    _cachedScaleFit   = (viewW / imgW < viewH / imgH) ? viewW / imgW : viewH / imgH;
+    _cachedFitOffsetX = (viewW - imgW * _cachedScaleFit) / 2.0;
+    _cachedFitOffsetY = (viewH - imgH * _cachedScaleFit) / 2.0;
   }
 
   void showPicker() {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text("Pick a Custom Color"),
+        title: const Text('Pick a Custom Color'),
         content: SingleChildScrollView(
           child: ColorPicker(
             pickerColor: selectedColor,
@@ -83,44 +119,36 @@ class _BasicScreenState extends State<BasicScreen> {
     );
   }
 
+  // ── Pointer handlers ───────────────────────────────────────────────────────
+
   void _onPointerDown(PointerDownEvent event) {
     _activePointers++;
     if (_activePointers == 1) {
-      // First finger down — record for tap detection
       _pointerDownPosition = event.localPosition;
-      _pointerDownTimeMs = DateTime.now().millisecondsSinceEpoch;
-      _pointerDragged = false;
+      _pointerDownTimeMs   = DateTime.now().millisecondsSinceEpoch;
+      _pointerDragged      = false;
     } else {
-      // Second finger (pinch-to-zoom) — cancel any pending tap
       _pointerDownPosition = null;
     }
   }
 
   void _onPointerMove(PointerMoveEvent event) {
     if (_pointerDownPosition != null && !_pointerDragged) {
-      final double dist = (event.localPosition - _pointerDownPosition!).distance;
-      if (dist > _tapMoveThreshold) {
-        _pointerDragged = true; // Finger moved too far — this is a pan, not a tap
+      if ((event.localPosition - _pointerDownPosition!).distance > _tapMoveThreshold) {
+        _pointerDragged = true;
       }
     }
   }
 
   void _onPointerUp(PointerUpEvent event) {
     _activePointers = (_activePointers - 1).clamp(0, 10);
-
-    // Only fire fill if: single finger, didn't drag, released quickly
-    if (_pointerDownPosition != null &&
-        !_pointerDragged &&
-        _activePointers == 0) {
+    if (_pointerDownPosition != null && !_pointerDragged && _activePointers == 0) {
       final int elapsed = DateTime.now().millisecondsSinceEpoch - _pointerDownTimeMs;
-      if (elapsed <= _tapMaxDurationMs) {
-        // Genuine tap — use the DOWN position for accuracy (not up, which may drift)
-        handleTap(_pointerDownPosition!);
-      }
+      if (elapsed <= _tapMaxDurationMs) handleTap(_pointerDownPosition!);
     }
     if (_activePointers == 0) {
       _pointerDownPosition = null;
-      _pointerDragged = false;
+      _pointerDragged      = false;
     }
   }
 
@@ -128,90 +156,76 @@ class _BasicScreenState extends State<BasicScreen> {
     _activePointers = (_activePointers - 1).clamp(0, 10);
     if (_activePointers == 0) {
       _pointerDownPosition = null;
-      _pointerDragged = false;
+      _pointerDragged      = false;
     }
   }
+
+  // ── Fill pipeline ──────────────────────────────────────────────────────────
 
   Future<void> handleTap(Offset localOffset) async {
     if (!pixelEngine.isLoaded || imageBytes == null || isProcessing) return;
 
-    final double imgW = pixelEngine.imageWidth.toDouble();
-    final double imgH = pixelEngine.imageHeight.toDouble();
-    final double viewW = _containerSize.width;
-    final double viewH = _containerSize.height;
-
-    if (viewW == 0 || viewH == 0) return;
-
-    // BoxFit.contain scale and centering offsets
-    final double scaleFit = (viewW / imgW < viewH / imgH) ? (viewW / imgW) : (viewH / imgH);
-    final double fitOffsetX = (viewW - imgW * scaleFit) / 2.0;
-    final double fitOffsetY = (viewH - imgH * scaleFit) / 2.0;
-
-    // Invert the InteractiveViewer transform: screen coords -> scene coords
-    final Matrix4 transform = _transformationController.value;
-    final Matrix4 inverse = Matrix4.inverted(transform);
-    final Vector3 scenePoint = inverse.transform3(
+    final Matrix4 inverse = Matrix4.inverted(_transformationController.value);
+    final Vector3 scene   = inverse.transform3(
       Vector3(localOffset.dx, localOffset.dy, 0),
     );
 
-    // Scene coords -> image pixel coords
-    final int pixelX = ((scenePoint.x - fitOffsetX) / scaleFit).floor();
-    final int pixelY = ((scenePoint.y - fitOffsetY) / scaleFit).floor();
+    final int pixelX = ((scene.x - _cachedFitOffsetX) / _cachedScaleFit).floor();
+    final int pixelY = ((scene.y - _cachedFitOffsetY) / _cachedScaleFit).floor();
 
-    // --- DEBUG (remove once confirmed working) ---
-    final double zoomScale = transform.getMaxScaleOnAxis();
-    final double panX = transform.getTranslation().x;
-    final double panY = transform.getTranslation().y;
-    debugPrint('');
-    debugPrint('========== TAP DEBUG ==========');
-    debugPrint('[1]  RAW TAP        : (${localOffset.dx.toStringAsFixed(2)}, ${localOffset.dy.toStringAsFixed(2)})');
-    debugPrint('[2]  CONTAINER SIZE : ${viewW.toStringAsFixed(1)} x ${viewH.toStringAsFixed(1)}');
-    debugPrint('[3]  IMAGE SIZE     : ${imgW.toInt()} x ${imgH.toInt()} px');
-    debugPrint('[4]  FIT SCALE      : ${scaleFit.toStringAsFixed(5)}');
-    debugPrint('[5]  FIT OFFSET     : dx=${fitOffsetX.toStringAsFixed(2)}, dy=${fitOffsetY.toStringAsFixed(2)}');
-    debugPrint('[6]  ZOOM / PAN     : zoom=${zoomScale.toStringAsFixed(4)}, panX=${panX.toStringAsFixed(2)}, panY=${panY.toStringAsFixed(2)}');
-    debugPrint('[7]  SCENE POINT    : (${scenePoint.x.toStringAsFixed(3)}, ${scenePoint.y.toStringAsFixed(3)})');
-    debugPrint('[8]  PIXEL TARGET   : ($pixelX, $pixelY)');
-    final Vector3 cs = inverse.transform3(Vector3(viewW / 2, viewH / 2, 0));
-    final int cPxX = ((cs.x - fitOffsetX) / scaleFit).floor();
-    final int cPxY = ((cs.y - fitOffsetY) / scaleFit).floor();
-    debugPrint('[9]  SCREEN CENTER  : maps to pixel ($cPxX, $cPxY)  [expected near (${(imgW / 2).toInt()}, ${(imgH / 2).toInt()})]');
-    // --- END DEBUG ---
+    if (pixelX < 0 || pixelX >= _rawWidth || pixelY < 0 || pixelY >= _rawHeight) return;
 
-    if (pixelX >= 0 && pixelX < imgW && pixelY >= 0 && pixelY < imgH) {
-      final img.Image? previewImg = img.decodeImage(imageBytes!);
-      if (previewImg != null) {
-        final int prePixel = previewImg.getPixel(pixelX, pixelY);
-        final int preR = img.getRed(prePixel);
-        final int preG = img.getGreen(prePixel);
-        final int preB = img.getBlue(prePixel);
-        debugPrint('[10] PRE-FILL COLOR : R=$preR G=$preG B=$preB   (border? ${preR < 60 && preG < 60 && preB < 60})');
-      }
-      debugPrint('================================');
+    setState(() => isProcessing = true);
 
-      setState(() => isProcessing = true);
+    final bool hasRaw = _rawFillBytes != null;
 
-      final request = FloodFillRequest(
-        imageBytes: imageBytes!,
-        x: pixelX,
-        y: pixelY,
-        fillColorRgba: img.getColor(selectedColor.red, selectedColor.green, selectedColor.blue, 255),
-      );
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  FILL ISOLATE                                               │
+    // │  First fill: decodes PNG once                               │
+    // │  Every fill after: Image.fromBytes (raw RGBA) — near-zero  │
+    // └─────────────────────────────────────────────────────────────┘
+    final Uint8List rawResult = await compute(
+      PixelEngine.processFloodFill,
+      FloodFillRequest(
+        imageBytes:    hasRaw ? _rawFillBytes! : imageBytes!,
+        x:             pixelX,
+        y:             pixelY,
+        fillColorRgba: img.getColor(
+          selectedColor.red, selectedColor.green, selectedColor.blue, 255,
+        ),
+        isRawRgba: hasRaw,
+        rawWidth:  _rawWidth,
+        rawHeight: _rawHeight,
+      ),
+    );
 
-      final Uint8List updatedBytes = await compute(PixelEngine.processFloodFill, request);
+    // Cache raw result — passed straight back on next tap
+    _rawFillBytes = rawResult;
 
-      debugPrint('[11] FILL APPLIED at ($pixelX, $pixelY)');
+    // Update engine in-memory image from raw bytes (no decode)
+    pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
 
-      pixelEngine.loadImage(updatedBytes);
-      setState(() {
-        imageBytes = updatedBytes;
-        isProcessing = false;
-      });
-    } else {
-      debugPrint('[10] !! OUT OF BOUNDS — ($pixelX, $pixelY) outside ${imgW.toInt()}x${imgH.toInt()}');
-      debugPrint('================================');
-    }
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  ENCODE ISOLATE                                             │
+    // │  Convert raw RGBA → JPEG for display, off the UI thread     │
+    // └─────────────────────────────────────────────────────────────┘
+    final Uint8List displayBytes = await compute(
+      _encodeToJpeg,
+      _EncodeRequest(rawResult, _rawWidth, _rawHeight),
+    );
+
+    setState(() {
+      imageBytes   = displayBytes;
+      isProcessing = false;
+    });
   }
+
+  static Uint8List _encodeToJpeg(_EncodeRequest req) {
+    final img.Image image = img.Image.fromBytes(req.width, req.height, req.bytes);
+    return Uint8List.fromList(img.encodeJpg(image, quality: 90));
+  }
+
+  // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -220,15 +234,20 @@ class _BasicScreenState extends State<BasicScreen> {
       appBar: AppBar(
         elevation: 0,
         backgroundColor: Colors.white,
-        title: const Text('Coloring Book',
-            style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+        title: const Text(
+          'Coloring Book',
+          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+        ),
         centerTitle: true,
         leading: isProcessing
-            ? const Padding(padding: EdgeInsets.all(15), child: CircularProgressIndicator(strokeWidth: 2))
+            ? const Padding(
+          padding: EdgeInsets.all(15),
+          child: CircularProgressIndicator(strokeWidth: 2),
+        )
             : null,
         actions: [
           IconButton(icon: const Icon(Icons.refresh, color: Colors.black), onPressed: loadImage),
-          IconButton(icon: Icon(Icons.colorize, color: selectedColor), onPressed: showPicker),
+          IconButton(icon: Icon(Icons.colorize, color: selectedColor),      onPressed: showPicker),
         ],
       ),
       body: SafeArea(
@@ -242,7 +261,9 @@ class _BasicScreenState extends State<BasicScreen> {
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(24),
-                    boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 20)],
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 20),
+                    ],
                   ),
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(24),
@@ -250,29 +271,31 @@ class _BasicScreenState extends State<BasicScreen> {
                         ? const Center(child: CircularProgressIndicator())
                         : LayoutBuilder(
                       builder: (context, constraints) {
-                        _containerSize = Size(constraints.maxWidth, constraints.maxHeight);
+                        final Size newSize =
+                        Size(constraints.maxWidth, constraints.maxHeight);
+                        if (_containerSize != newSize) {
+                          _containerSize = newSize;
+                          _updateFitCache();
+                        }
                         return Listener(
-                          // Listener sits OUTSIDE InteractiveViewer so localPosition
-                          // is always relative to the true container top-left.
-                          // We manually distinguish tap vs pan/pinch using pointer tracking.
-                          onPointerDown: _onPointerDown,
-                          onPointerMove: _onPointerMove,
-                          onPointerUp: _onPointerUp,
+                          onPointerDown:   _onPointerDown,
+                          onPointerMove:   _onPointerMove,
+                          onPointerUp:     _onPointerUp,
                           onPointerCancel: _onPointerCancel,
                           child: InteractiveViewer(
                             transformationController: _transformationController,
-                            panEnabled: true,
-                            minScale: 1.0,
-                            maxScale: 10.0,
+                            panEnabled:  true,
+                            minScale:    1.0,
+                            maxScale:    10.0,
                             constrained: true,
                             child: SizedBox(
-                              width: constraints.maxWidth,
+                              width:  constraints.maxWidth,
                               height: constraints.maxHeight,
                               child: Center(
                                 child: Image.memory(
                                   imageBytes!,
-                                  key: ValueKey('img_${currentImageIndex}_${imageBytes!.length}'),
-                                  fit: BoxFit.contain,
+                                  key:             ValueKey(imageBytes.hashCode),
+                                  fit:             BoxFit.contain,
                                   gaplessPlayback: true,
                                 ),
                               ),
@@ -298,7 +321,7 @@ class _BasicScreenState extends State<BasicScreen> {
       decoration: const BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.only(
-          topLeft: Radius.circular(30),
+          topLeft:  Radius.circular(30),
           topRight: Radius.circular(30),
         ),
       ),
@@ -310,9 +333,10 @@ class _BasicScreenState extends State<BasicScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                _navBtn(Icons.arrow_back_ios, () => _changeImage(-1)),
-                const Text("PALETTE",
-                    style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: Colors.grey)),
+                _navBtn(Icons.arrow_back_ios,    () => _changeImage(-1)),
+                const Text('PALETTE',
+                    style: TextStyle(
+                        fontWeight: FontWeight.w900, fontSize: 12, color: Colors.grey)),
                 _navBtn(Icons.arrow_forward_ios, () => _changeImage(1)),
               ],
             ),
@@ -343,10 +367,17 @@ class _BasicScreenState extends State<BasicScreen> {
         decoration: BoxDecoration(
           color: color,
           shape: BoxShape.circle,
-          border: Border.all(color: isSelected ? Colors.blueAccent : Colors.white, width: 3),
-          boxShadow: [if (isSelected) BoxShadow(color: color.withOpacity(0.5), blurRadius: 10)],
+          border: Border.all(
+            color: isSelected ? Colors.blueAccent : Colors.white,
+            width: 3,
+          ),
+          boxShadow: [
+            if (isSelected) BoxShadow(color: color.withOpacity(0.5), blurRadius: 10),
+          ],
         ),
-        child: isSelected ? const Icon(Icons.check, color: Colors.white, size: 20) : null,
+        child: isSelected
+            ? const Icon(Icons.check, color: Colors.white, size: 20)
+            : null,
       ),
     );
   }

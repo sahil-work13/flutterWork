@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
@@ -7,13 +8,6 @@ import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:image/image.dart' as img;
 import 'package:vector_math/vector_math_64.dart' show Vector3;
 import '../engine/PixelEngine.dart';
-
-class _EncodeRequest {
-  final Uint8List bytes;
-  final int width;
-  final int height;
-  _EncodeRequest(this.bytes, this.width, this.height);
-}
 
 class BasicScreen extends StatefulWidget {
   const BasicScreen({super.key});
@@ -25,7 +19,7 @@ class BasicScreen extends StatefulWidget {
 class _BasicScreenState extends State<BasicScreen> {
   final PixelEngine pixelEngine = PixelEngine();
 
-  // ui.Image is rendered directly by RawImage — no encode/decode for display
+  // ui.Image rendered directly by RawImage — no encode/decode for display
   ui.Image? _uiImage;
 
   // Raw RGBA bytes cached between fills — isolate skips decodeImage on 2nd+ fills
@@ -34,6 +28,12 @@ class _BasicScreenState extends State<BasicScreen> {
   Uint8List? _originalBytes;
   int _rawWidth  = 0;
   int _rawHeight = 0;
+
+  // ── Undo stack ─────────────────────────────────────────────────────────────
+  // Each entry is the raw RGBA snapshot BEFORE that fill was applied.
+  // Pop to restore the previous state. Capped at 20 to limit memory.
+  final Queue<Uint8List> _undoStack = Queue<Uint8List>();
+  static const int _maxUndoSteps   = 20;
 
   Color selectedColor     = const Color(0xFFFFC107);
   bool  isProcessing      = false;
@@ -78,20 +78,24 @@ class _BasicScreenState extends State<BasicScreen> {
     super.dispose();
   }
 
+  // ── Image loading ──────────────────────────────────────────────────────────
+
   Future<void> loadImage() async {
     try {
       final ByteData data   = await rootBundle.load(testImages[currentImageIndex]);
       final Uint8List bytes = data.buffer.asUint8List();
 
+      // loadImage now also bakes the frozen border mask from the original PNG
       pixelEngine.loadImage(bytes);
       _originalBytes = bytes;
       _rawFillBytes  = null;
       _rawWidth      = pixelEngine.imageWidth;
       _rawHeight     = pixelEngine.imageHeight;
 
-      // Decode to ui.Image for flicker-free display
-      final ui.Image loaded = await _decodeToUiImage(bytes);
+      // Clear undo history when a new image is loaded
+      _undoStack.clear();
 
+      final ui.Image loaded = await _decodeToUiImage(bytes);
       _uiImage?.dispose();
       setState(() {
         _uiImage = loaded;
@@ -103,24 +107,22 @@ class _BasicScreenState extends State<BasicScreen> {
     }
   }
 
-  /// Decodes any encoded image bytes (PNG/JPEG) to a ui.Image
   Future<ui.Image> _decodeToUiImage(Uint8List bytes) async {
-    final ui.Codec codec = await ui.instantiateImageCodec(bytes);
+    final ui.Codec     codec = await ui.instantiateImageCodec(bytes);
     final ui.FrameInfo frame = await codec.getNextFrame();
     codec.dispose();
     return frame.image;
   }
 
-  /// Converts raw RGBA bytes directly to ui.Image — no codec, instant
   Future<ui.Image> _rawRgbaToUiImage(Uint8List rgba, int width, int height) async {
     final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(rgba);
     final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
       buffer,
-      width:           width,
-      height:          height,
-      pixelFormat:     ui.PixelFormat.rgba8888,
+      width:       width,
+      height:      height,
+      pixelFormat: ui.PixelFormat.rgba8888,
     );
-    final ui.Codec codec = await descriptor.instantiateCodec();
+    final ui.Codec     codec = await descriptor.instantiateCodec();
     final ui.FrameInfo frame = await codec.getNextFrame();
     codec.dispose();
     descriptor.dispose();
@@ -155,7 +157,7 @@ class _BasicScreenState extends State<BasicScreen> {
     );
   }
 
-  // ── Pointer handlers ───────────────────────────────────────────────────────
+  // ── Pointer handlers — UNCHANGED ───────────────────────────────────────────
 
   void _onPointerDown(PointerDownEvent event) {
     _activePointers++;
@@ -211,12 +213,21 @@ class _BasicScreenState extends State<BasicScreen> {
 
     if (pixelX < 0 || pixelX >= _rawWidth || pixelY < 0 || pixelY >= _rawHeight) return;
 
-    // Lock — no setState here, no UI flicker
+    // Lock without setState — no UI flicker
     isProcessing = true;
+
+    // ── Push undo snapshot BEFORE the fill ─────────────────────────────────
+    // Store whatever the current raw bytes are so we can restore them on undo.
+    // _rawFillBytes is null before the first fill, so we snapshot _originalBytes.
+    final Uint8List snapshot = _rawFillBytes ?? _originalBytes!;
+    if (_undoStack.length >= _maxUndoSteps) _undoStack.removeFirst();
+    _undoStack.addLast(snapshot);
 
     final bool hasRaw = _rawFillBytes != null;
 
-    // BFS fill in background isolate — returns raw RGBA, no encode
+    // BFS fill in background isolate — returns raw RGBA, no encode.
+    // Now passes the frozen borderMask so user-filled black pixels
+    // are never treated as borders.
     final Uint8List rawResult = await compute(
       PixelEngine.processFloodFill,
       FloodFillRequest(
@@ -226,26 +237,68 @@ class _BasicScreenState extends State<BasicScreen> {
         fillColorRgba: img.getColor(
           selectedColor.red, selectedColor.green, selectedColor.blue, 255,
         ),
-        isRawRgba: hasRaw,
-        rawWidth:  _rawWidth,
-        rawHeight: _rawHeight,
+        borderMask: pixelEngine.borderMask, // frozen from original PNG
+        isRawRgba:  hasRaw,
+        rawWidth:   _rawWidth,
+        rawHeight:  _rawHeight,
       ),
     );
 
-    // Cache raw bytes for next fill
     _rawFillBytes = rawResult;
     pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
 
-    // Convert raw RGBA → ui.Image directly — no PNG/JPEG encode at all
-    final ui.Image newUiImage = await _rawRgbaToUiImage(rawResult, _rawWidth, _rawHeight);
+    final ui.Image newUiImage =
+    await _rawRgbaToUiImage(rawResult, _rawWidth, _rawHeight);
 
-    // Swap old image for new — single setState, no intermediate blank frame
     final ui.Image? oldImage = _uiImage;
     setState(() {
       _uiImage     = newUiImage;
       isProcessing = false;
     });
-    // Dispose old image AFTER setState so it's never disposed while being rendered
+    oldImage?.dispose();
+  }
+
+  // ── Undo ───────────────────────────────────────────────────────────────────
+
+  Future<void> _undo() async {
+    if (_undoStack.isEmpty || isProcessing) return;
+
+    isProcessing = true;
+
+    // Pop the most recent snapshot
+    final Uint8List previous = _undoStack.removeLast();
+
+    // Determine if the snapshot is raw RGBA or original encoded PNG.
+    // The very first snapshot pushed is _originalBytes (encoded PNG).
+    // Every subsequent snapshot is raw RGBA from a fill.
+    // We distinguish them by checking if this snapshot IS _originalBytes.
+    final bool isOriginalPng = identical(previous, _originalBytes);
+
+    ui.Image restoredImage;
+
+    if (isOriginalPng) {
+      // Restoring to clean slate — decode the original PNG
+      restoredImage  = await _decodeToUiImage(previous);
+      _rawFillBytes  = null; // back to clean state, next fill will decode PNG
+    } else {
+      // Restoring to a previous raw RGBA fill state
+      restoredImage = await _rawRgbaToUiImage(previous, _rawWidth, _rawHeight);
+      _rawFillBytes = previous;
+    }
+
+    pixelEngine.updateFromRawBytes(
+      isOriginalPng
+          ? (img.decodeImage(previous)?.getBytes() ?? previous)
+          : previous,
+      _rawWidth,
+      _rawHeight,
+    );
+
+    final ui.Image? oldImage = _uiImage;
+    setState(() {
+      _uiImage     = restoredImage;
+      isProcessing = false;
+    });
     oldImage?.dispose();
   }
 
@@ -256,23 +309,39 @@ class _BasicScreenState extends State<BasicScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFFF5F5F7),
       appBar: AppBar(
-        elevation: 0,
+        elevation:       0,
         backgroundColor: Colors.white,
         title: const Text(
           'Coloring Book',
           style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
         ),
         centerTitle: true,
-        // Subtle indicator — no full-screen loader
         leading: isProcessing
             ? const Padding(
           padding: EdgeInsets.all(15),
-          child: CircularProgressIndicator(strokeWidth: 2),
+          child:   CircularProgressIndicator(strokeWidth: 2),
         )
             : null,
         actions: [
-          IconButton(icon: const Icon(Icons.refresh, color: Colors.black), onPressed: loadImage),
-          IconButton(icon: Icon(Icons.colorize, color: selectedColor),      onPressed: showPicker),
+          // Undo button — greyed out when stack is empty
+          IconButton(
+            icon: Icon(
+              Icons.undo,
+              color: _undoStack.isNotEmpty ? Colors.black : Colors.grey.shade300,
+            ),
+            onPressed: _undoStack.isNotEmpty ? _undo : null,
+            tooltip: 'Undo',
+          ),
+          IconButton(
+            icon:      const Icon(Icons.refresh, color: Colors.black),
+            onPressed: loadImage,
+            tooltip:   'Reset image',
+          ),
+          IconButton(
+            icon:      Icon(Icons.colorize, color: selectedColor),
+            onPressed: showPicker,
+            tooltip:   'Pick colour',
+          ),
         ],
       ),
       body: SafeArea(
@@ -284,7 +353,7 @@ class _BasicScreenState extends State<BasicScreen> {
                 padding: const EdgeInsets.all(12.0),
                 child: Container(
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color:        Colors.white,
                     borderRadius: BorderRadius.circular(24),
                     boxShadow: [
                       BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 20),
@@ -296,7 +365,8 @@ class _BasicScreenState extends State<BasicScreen> {
                         ? const Center(child: CircularProgressIndicator())
                         : LayoutBuilder(
                       builder: (context, constraints) {
-                        final Size newSize = Size(constraints.maxWidth, constraints.maxHeight);
+                        final Size newSize =
+                        Size(constraints.maxWidth, constraints.maxHeight);
                         if (_containerSize != newSize) {
                           _containerSize = newSize;
                           _updateFitCache();
@@ -316,11 +386,9 @@ class _BasicScreenState extends State<BasicScreen> {
                               width:  constraints.maxWidth,
                               height: constraints.maxHeight,
                               child: Center(
-                                // RawImage renders ui.Image directly on the GPU
-                                // No encode → decode cycle, no widget rebuild flicker
                                 child: RawImage(
-                                  image:    _uiImage,
-                                  fit:      BoxFit.contain,
+                                  image:         _uiImage,
+                                  fit:           BoxFit.contain,
                                   filterQuality: FilterQuality.medium,
                                 ),
                               ),
@@ -359,9 +427,11 @@ class _BasicScreenState extends State<BasicScreen> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 _navBtn(Icons.arrow_back_ios,    () => _changeImage(-1)),
-                const Text('PALETTE',
-                    style: TextStyle(
-                        fontWeight: FontWeight.w900, fontSize: 12, color: Colors.grey)),
+                const Text(
+                  'PALETTE',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w900, fontSize: 12, color: Colors.grey),
+                ),
                 _navBtn(Icons.arrow_forward_ios, () => _changeImage(1)),
               ],
             ),
@@ -371,8 +441,8 @@ class _BasicScreenState extends State<BasicScreen> {
             height: 55,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 15),
-              itemCount: colorHistory.length,
+              padding:         const EdgeInsets.symmetric(horizontal: 15),
+              itemCount:       colorHistory.length,
               itemBuilder: (context, i) => _buildColorCircle(colorHistory[i]),
             ),
           ),
@@ -387,11 +457,11 @@ class _BasicScreenState extends State<BasicScreen> {
       onTap: () => setState(() => selectedColor = color),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
-        margin: const EdgeInsets.symmetric(horizontal: 8),
-        width: isSelected ? 52 : 44,
+        margin:   const EdgeInsets.symmetric(horizontal: 8),
+        width:    isSelected ? 52 : 44,
         decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
+          color:  color,
+          shape:  BoxShape.circle,
           border: Border.all(
             color: isSelected ? Colors.blueAccent : Colors.white,
             width: 3,
@@ -408,7 +478,8 @@ class _BasicScreenState extends State<BasicScreen> {
   }
 
   void _changeImage(int delta) {
-    setState(() => currentImageIndex = (currentImageIndex + delta) % testImages.length);
+    setState(
+            () => currentImageIndex = (currentImageIndex + delta) % testImages.length);
     loadImage();
   }
 

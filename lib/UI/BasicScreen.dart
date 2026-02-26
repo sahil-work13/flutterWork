@@ -19,6 +19,7 @@ class _SessionSnapshot {
   final int rawWidth;
   final int rawHeight;
   final Uint8List? rawFillBytes;
+  final List<Uint8List?> undoStack;
 
   const _SessionSnapshot({
     required this.imageIndex,
@@ -27,6 +28,7 @@ class _SessionSnapshot {
     required this.rawWidth,
     required this.rawHeight,
     required this.rawFillBytes,
+    required this.undoStack,
   });
 }
 
@@ -35,12 +37,14 @@ class _ImageSessionState {
   final int fillCount;
   final int rawWidth;
   final int rawHeight;
+  final List<Uint8List?> undoStack;
 
   const _ImageSessionState({
     required this.rawFillBytes,
     required this.fillCount,
     required this.rawWidth,
     required this.rawHeight,
+    required this.undoStack,
   });
 }
 
@@ -155,6 +159,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.raw',
   );
 
+  File _imageUndoRawFile(int imageIndex, int undoIndex) => File(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_undo_$undoIndex.raw',
+  );
+
   Future<void> _initWithRestore() async {
     final bool restored = await _restoreSessionIfAvailable();
     if (!restored) {
@@ -197,6 +205,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       rawWidth: _rawWidth,
       rawHeight: _rawHeight,
       rawFillBytes: _rawFillBytes,
+      undoStack: List<Uint8List?>.from(_undoStack),
     );
   }
 
@@ -244,12 +253,31 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         fillCount: snapshot.fillCount,
         rawWidth: snapshot.rawWidth,
         rawHeight: snapshot.rawHeight,
+        undoStack: List<Uint8List?>.from(snapshot.undoStack),
       );
 
       if (snapshot.rawFillBytes != null) {
         await imageRawFile.writeAsBytes(snapshot.rawFillBytes!);
       } else if (await imageRawFile.exists()) {
         await imageRawFile.delete();
+      }
+
+      for (int i = 0; i < _maxUndoSteps; i++) {
+        final File undoFile = _imageUndoRawFile(snapshot.imageIndex, i);
+        if (await undoFile.exists()) {
+          await undoFile.delete();
+        }
+      }
+
+      final List<int> undoKinds = <int>[];
+      for (int i = 0; i < snapshot.undoStack.length; i++) {
+        final Uint8List? entry = snapshot.undoStack[i];
+        if (entry == null) {
+          undoKinds.add(0);
+          continue;
+        }
+        undoKinds.add(1);
+        await _imageUndoRawFile(snapshot.imageIndex, i).writeAsBytes(entry);
       }
 
       final Map<String, dynamic> imageMeta = <String, dynamic>{
@@ -259,6 +287,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         'hasRawFill': snapshot.rawFillBytes != null,
         'rawWidth': snapshot.rawWidth,
         'rawHeight': snapshot.rawHeight,
+        'undoKinds': undoKinds,
         'savedAt': DateTime.now().toIso8601String(),
       };
       await imageMetaFile.writeAsString(jsonEncode(imageMeta));
@@ -282,14 +311,13 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         cached.rawHeight == _rawHeight) {
       _fillCount = cached.fillCount;
       _rawFillBytes = cached.rawFillBytes;
+      _undoStack
+        ..clear()
+        ..addAll(cached.undoStack);
       if (_rawFillBytes != null) {
         pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
-        _undoStack
-          ..clear()
-          ..add(null);
         return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
       }
-      _undoStack.clear();
       return _decodeToUiImage(originalBytes);
     }
 
@@ -305,6 +333,31 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
             (meta['rawWidth'] is int) ? meta['rawWidth'] as int : _rawWidth;
         final int savedHeight =
             (meta['rawHeight'] is int) ? meta['rawHeight'] as int : _rawHeight;
+        final List<int> undoKinds = (meta['undoKinds'] is List)
+            ? (meta['undoKinds'] as List)
+                  .map((dynamic e) => (e is int) ? e : -1)
+                  .toList()
+            : <int>[];
+
+        final List<Uint8List?> restoredUndo = <Uint8List?>[];
+        for (int i = 0; i < undoKinds.length; i++) {
+          final int kind = undoKinds[i];
+          if (kind == 0) {
+            restoredUndo.add(null);
+            continue;
+          }
+          if (kind == 1) {
+            final File undoFile = _imageUndoRawFile(currentImageIndex, i);
+            if (!await undoFile.exists()) continue;
+            final Uint8List rawUndo = await undoFile.readAsBytes();
+            if (rawUndo.lengthInBytes == _rawWidth * _rawHeight * 4) {
+              restoredUndo.add(rawUndo);
+            }
+          }
+        }
+        _undoStack
+          ..clear()
+          ..addAll(restoredUndo);
 
         if (hasRawFill &&
             savedWidth == _rawWidth &&
@@ -321,10 +374,8 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                 fillCount: _fillCount,
                 rawWidth: _rawWidth,
                 rawHeight: _rawHeight,
+                undoStack: List<Uint8List?>.from(_undoStack),
               );
-              _undoStack
-                ..clear()
-                ..add(null);
               return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
             }
           }
@@ -341,6 +392,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       fillCount: 0,
       rawWidth: _rawWidth,
       rawHeight: _rawHeight,
+      undoStack: <Uint8List?>[],
     );
     _undoStack.clear();
     return _decodeToUiImage(originalBytes);
@@ -365,6 +417,13 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         _rawFillBytes = null;
         _fillCount = 0;
         _undoStack.clear();
+        _imageStateCache[currentImageIndex] = _ImageSessionState(
+          rawFillBytes: null,
+          fillCount: 0,
+          rawWidth: _rawWidth,
+          rawHeight: _rawHeight,
+          undoStack: <Uint8List?>[],
+        );
       }
       if (!mounted) {
         loaded.dispose();
@@ -557,6 +616,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         fillCount: _fillCount,
         rawWidth: _rawWidth,
         rawHeight: _rawHeight,
+        undoStack: List<Uint8List?>.from(_undoStack),
       );
 
       final ui.Image newUiImage = await _rawRgbaToUiImage(
@@ -590,6 +650,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     setState(() => isProcessing = true);
     try {
       final Uint8List? snapshot = _undoStack.removeLast();
+      if (_fillCount > 0) _fillCount--;
 
       ui.Image restoredImage;
       if (snapshot == null) {
@@ -616,6 +677,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         fillCount: _fillCount,
         rawWidth: _rawWidth,
         rawHeight: _rawHeight,
+        undoStack: List<Uint8List?>.from(_undoStack),
       );
 
       if (!mounted) {
@@ -645,6 +707,12 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       final File rawFile = _imageRawFile(currentImageIndex);
       if (await metaFile.exists()) await metaFile.delete();
       if (await rawFile.exists()) await rawFile.delete();
+      for (int i = 0; i < _maxUndoSteps; i++) {
+        final File undoFile = _imageUndoRawFile(currentImageIndex, i);
+        if (await undoFile.exists()) {
+          await undoFile.delete();
+        }
+      }
       _imageStateCache.remove(currentImageIndex);
     } catch (e) {
       _log('REFRESH', 'ERROR: $e');

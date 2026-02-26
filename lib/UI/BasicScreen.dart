@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -9,6 +12,38 @@ void _log(String tag, String msg) {
   debugPrint('[COLOR_APP][$tag] $msg');
 }
 
+class _SessionSnapshot {
+  final int imageIndex;
+  final int selectedColorValue;
+  final int fillCount;
+  final int rawWidth;
+  final int rawHeight;
+  final Uint8List? rawFillBytes;
+
+  const _SessionSnapshot({
+    required this.imageIndex,
+    required this.selectedColorValue,
+    required this.fillCount,
+    required this.rawWidth,
+    required this.rawHeight,
+    required this.rawFillBytes,
+  });
+}
+
+class _ImageSessionState {
+  final Uint8List? rawFillBytes;
+  final int fillCount;
+  final int rawWidth;
+  final int rawHeight;
+
+  const _ImageSessionState({
+    required this.rawFillBytes,
+    required this.fillCount,
+    required this.rawWidth,
+    required this.rawHeight,
+  });
+}
+
 class BasicScreen extends StatefulWidget {
   const BasicScreen({super.key});
 
@@ -16,7 +51,8 @@ class BasicScreen extends StatefulWidget {
   State<BasicScreen> createState() => _BasicScreenState();
 }
 
-class _BasicScreenState extends State<BasicScreen> {
+class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
+  static const String _sessionNamespace = 'coloring_book_session_v1';
   final PixelEngine pixelEngine = PixelEngine();
   final TransformationController _transformationController =
       TransformationController();
@@ -34,6 +70,12 @@ class _BasicScreenState extends State<BasicScreen> {
   Color selectedColor = const Color(0xFFFFC107);
   bool isProcessing = false;
   int currentImageIndex = 0;
+  bool _isPersisting = false;
+  _SessionSnapshot? _pendingSnapshot;
+  Timer? _autosaveTimer;
+  static const Duration _autosaveDebounce = Duration(milliseconds: 350);
+  final Map<int, _ImageSessionState> _imageStateCache =
+      <int, _ImageSessionState>{};
 
   Size _containerSize = Size.zero;
   double _cachedScaleFit = 1.0;
@@ -59,7 +101,7 @@ class _BasicScreenState extends State<BasicScreen> {
     const Color(0xFFE91E63),
     const Color(0xFF9C27B0),
     const Color(0xFF2196F3),
-    const ui.Color.fromARGB(255, 255, 255, 255),
+    const Color(0xFF00BCD4),
     const Color(0xFF4CAF50),
     const Color(0xFFFFEB3B),
     const Color(0xFFFF9800),
@@ -79,16 +121,232 @@ class _BasicScreenState extends State<BasicScreen> {
   @override
   void initState() {
     super.initState();
-    loadImage();
+    WidgetsBinding.instance.addObserver(this);
+    _initWithRestore();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _autosaveTimer?.cancel();
+    unawaited(_scheduleSessionSave());
     _uiImage?.dispose();
     super.dispose();
   }
 
-  Future<void> loadImage() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _requestAutosave(immediate: true);
+    }
+  }
+
+  File get _sessionMetaFile => File(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.json',
+  );
+
+  File _imageMetaFile(int imageIndex) => File(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.json',
+  );
+
+  File _imageRawFile(int imageIndex) => File(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.raw',
+  );
+
+  Future<void> _initWithRestore() async {
+    final bool restored = await _restoreSessionIfAvailable();
+    if (!restored) {
+      await loadImage();
+      return;
+    }
+    await loadImage();
+  }
+
+  Future<bool> _restoreSessionIfAvailable() async {
+    try {
+      if (!await _sessionMetaFile.exists()) return false;
+
+      final String text = await _sessionMetaFile.readAsString();
+      final Map<String, dynamic> meta =
+          jsonDecode(text) as Map<String, dynamic>;
+
+      final int restoredIndex = (meta['currentImageIndex'] is int)
+          ? meta['currentImageIndex'] as int
+          : 0;
+      if (restoredIndex < 0 || restoredIndex >= testImages.length) return false;
+
+      currentImageIndex = restoredIndex;
+
+      if (meta['selectedColor'] is int) {
+        selectedColor = Color(meta['selectedColor'] as int);
+      }
+      return true;
+    } catch (e) {
+      _log('RESTORE', 'ERROR: $e');
+      return false;
+    }
+  }
+
+  _SessionSnapshot _captureSessionSnapshot() {
+    return _SessionSnapshot(
+      imageIndex: currentImageIndex,
+      selectedColorValue: selectedColor.toARGB32(),
+      fillCount: _fillCount,
+      rawWidth: _rawWidth,
+      rawHeight: _rawHeight,
+      rawFillBytes: _rawFillBytes,
+    );
+  }
+
+  void _requestAutosave({bool immediate = false}) {
+    if (immediate) {
+      _autosaveTimer?.cancel();
+      unawaited(_scheduleSessionSave());
+      return;
+    }
+
+    _autosaveTimer?.cancel();
+    _autosaveTimer = Timer(_autosaveDebounce, () {
+      unawaited(_scheduleSessionSave());
+    });
+  }
+
+  Future<void> _scheduleSessionSave() async {
+    final _SessionSnapshot snapshot = _captureSessionSnapshot();
+    if (_isPersisting) {
+      _pendingSnapshot = snapshot;
+      return;
+    }
+
+    _isPersisting = true;
+    _SessionSnapshot current = snapshot;
+    while (true) {
+      await _persistSessionSnapshot(current);
+      final _SessionSnapshot? pending = _pendingSnapshot;
+      if (pending == null) break;
+      _pendingSnapshot = null;
+      current = pending;
+    }
+    _isPersisting = false;
+  }
+
+  Future<void> _persistSessionSnapshot(_SessionSnapshot snapshot) async {
+    try {
+      if (snapshot.rawWidth <= 0 || snapshot.rawHeight <= 0) return;
+
+      final File imageMetaFile = _imageMetaFile(snapshot.imageIndex);
+      final File imageRawFile = _imageRawFile(snapshot.imageIndex);
+
+      _imageStateCache[snapshot.imageIndex] = _ImageSessionState(
+        rawFillBytes: snapshot.rawFillBytes,
+        fillCount: snapshot.fillCount,
+        rawWidth: snapshot.rawWidth,
+        rawHeight: snapshot.rawHeight,
+      );
+
+      if (snapshot.rawFillBytes != null) {
+        await imageRawFile.writeAsBytes(snapshot.rawFillBytes!);
+      } else if (await imageRawFile.exists()) {
+        await imageRawFile.delete();
+      }
+
+      final Map<String, dynamic> imageMeta = <String, dynamic>{
+        'version': 1,
+        'imageIndex': snapshot.imageIndex,
+        'fillCount': snapshot.fillCount,
+        'hasRawFill': snapshot.rawFillBytes != null,
+        'rawWidth': snapshot.rawWidth,
+        'rawHeight': snapshot.rawHeight,
+        'savedAt': DateTime.now().toIso8601String(),
+      };
+      await imageMetaFile.writeAsString(jsonEncode(imageMeta));
+
+      final Map<String, dynamic> sessionMeta = <String, dynamic>{
+        'version': 1,
+        'currentImageIndex': snapshot.imageIndex,
+        'selectedColor': snapshot.selectedColorValue,
+        'savedAt': DateTime.now().toIso8601String(),
+      };
+      await _sessionMetaFile.writeAsString(jsonEncode(sessionMeta));
+    } catch (e) {
+      _log('AUTOSAVE', 'ERROR: $e');
+    }
+  }
+
+  Future<ui.Image> _buildCurrentImageFromSavedState(Uint8List originalBytes) async {
+    final _ImageSessionState? cached = _imageStateCache[currentImageIndex];
+    if (cached != null &&
+        cached.rawWidth == _rawWidth &&
+        cached.rawHeight == _rawHeight) {
+      _fillCount = cached.fillCount;
+      _rawFillBytes = cached.rawFillBytes;
+      if (_rawFillBytes != null) {
+        pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
+        _undoStack
+          ..clear()
+          ..add(null);
+        return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
+      }
+      _undoStack.clear();
+      return _decodeToUiImage(originalBytes);
+    }
+
+    final File imageMetaFile = _imageMetaFile(currentImageIndex);
+    if (await imageMetaFile.exists()) {
+      try {
+        final String text = await imageMetaFile.readAsString();
+        final Map<String, dynamic> meta = jsonDecode(text) as Map<String, dynamic>;
+
+        _fillCount = (meta['fillCount'] is int) ? meta['fillCount'] as int : 0;
+        final bool hasRawFill = meta['hasRawFill'] == true;
+        final int savedWidth =
+            (meta['rawWidth'] is int) ? meta['rawWidth'] as int : _rawWidth;
+        final int savedHeight =
+            (meta['rawHeight'] is int) ? meta['rawHeight'] as int : _rawHeight;
+
+        if (hasRawFill &&
+            savedWidth == _rawWidth &&
+            savedHeight == _rawHeight) {
+          final File imageRawFile = _imageRawFile(currentImageIndex);
+          if (await imageRawFile.exists()) {
+            final Uint8List raw = await imageRawFile.readAsBytes();
+            final int expectedLen = _rawWidth * _rawHeight * 4;
+            if (raw.lengthInBytes == expectedLen) {
+              _rawFillBytes = raw;
+              pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
+              _imageStateCache[currentImageIndex] = _ImageSessionState(
+                rawFillBytes: _rawFillBytes,
+                fillCount: _fillCount,
+                rawWidth: _rawWidth,
+                rawHeight: _rawHeight,
+              );
+              _undoStack
+                ..clear()
+                ..add(null);
+              return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
+            }
+          }
+        }
+      } catch (e) {
+        _log('RESTORE_IMAGE', 'ERROR: $e');
+      }
+    }
+
+    _rawFillBytes = null;
+    _fillCount = 0;
+    _imageStateCache[currentImageIndex] = _ImageSessionState(
+      rawFillBytes: null,
+      fillCount: 0,
+      rawWidth: _rawWidth,
+      rawHeight: _rawHeight,
+    );
+    _undoStack.clear();
+    return _decodeToUiImage(originalBytes);
+  }
+
+  Future<void> loadImage({bool restoreSavedState = true}) async {
     try {
       final ByteData data = await rootBundle.load(
         testImages[currentImageIndex],
@@ -96,13 +354,18 @@ class _BasicScreenState extends State<BasicScreen> {
       final Uint8List bytes = data.buffer.asUint8List();
 
       pixelEngine.loadImage(bytes);
-      _rawFillBytes = null;
       _rawWidth = pixelEngine.imageWidth;
       _rawHeight = pixelEngine.imageHeight;
-      _fillCount = 0;
       _undoStack.clear();
 
-      final ui.Image loaded = await _decodeToUiImage(bytes);
+      final ui.Image loaded = restoreSavedState
+          ? await _buildCurrentImageFromSavedState(bytes)
+          : await _decodeToUiImage(bytes);
+      if (!restoreSavedState) {
+        _rawFillBytes = null;
+        _fillCount = 0;
+        _undoStack.clear();
+      }
       if (!mounted) {
         loaded.dispose();
         return;
@@ -244,99 +507,150 @@ class _BasicScreenState extends State<BasicScreen> {
       return;
     }
 
-    isProcessing = true;
-    _fillCount++;
-    final int thisFill = _fillCount;
+    setState(() {
+      isProcessing = true;
+    });
 
-    final Uint8List? snapshot = _rawFillBytes == null
-        ? null
-        : Uint8List.fromList(_rawFillBytes!);
+    try {
+      _fillCount++;
+      final int thisFill = _fillCount;
 
-    if (_undoStack.length >= _maxUndoSteps) {
-      if (_undoStack[0] == null) {
-        _log(
-          'FILL#$thisFill',
-          'Stack full. Protecting original. Removing index 1.',
-        );
-        _undoStack.removeAt(1);
-      } else {
-        _log('FILL#$thisFill', 'Stack full. Removing oldest.');
-        _undoStack.removeAt(0);
+      final Uint8List? snapshot = _rawFillBytes == null
+          ? null
+          : Uint8List.fromList(_rawFillBytes!);
+
+      if (_undoStack.length >= _maxUndoSteps) {
+        if (_undoStack[0] == null) {
+          _log(
+            'FILL#$thisFill',
+            'Stack full. Protecting original. Removing index 1.',
+          );
+          _undoStack.removeAt(1);
+        } else {
+          _log('FILL#$thisFill', 'Stack full. Removing oldest.');
+          _undoStack.removeAt(0);
+        }
+      }
+      _undoStack.add(snapshot);
+
+      final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
+
+      final Uint8List rawResult = await compute(
+        PixelEngine.processFloodFill,
+        FloodFillRequest(
+          rawRgbaBytes: baseRaw,
+          borderMask: pixelEngine.borderMask,
+          x: pixelX,
+          y: pixelY,
+          width: _rawWidth,
+          height: _rawHeight,
+          fillR: _to8Bit(selectedColor.r),
+          fillG: _to8Bit(selectedColor.g),
+          fillB: _to8Bit(selectedColor.b),
+        ),
+      );
+
+      _rawFillBytes = rawResult;
+      pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
+      _imageStateCache[currentImageIndex] = _ImageSessionState(
+        rawFillBytes: _rawFillBytes,
+        fillCount: _fillCount,
+        rawWidth: _rawWidth,
+        rawHeight: _rawHeight,
+      );
+
+      final ui.Image newUiImage = await _rawRgbaToUiImage(
+        rawResult,
+        _rawWidth,
+        _rawHeight,
+      );
+      if (!mounted) {
+        newUiImage.dispose();
+        return;
+      }
+
+      final ui.Image? oldImage = _uiImage;
+      setState(() {
+        _uiImage = newUiImage;
+        isProcessing = false;
+      });
+      oldImage?.dispose();
+      _requestAutosave();
+    } catch (e) {
+      _log('FILL', 'ERROR: $e');
+      if (mounted) {
+        setState(() => isProcessing = false);
       }
     }
-    _undoStack.add(snapshot);
-
-    final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
-
-    final Uint8List rawResult = await compute(
-      PixelEngine.processFloodFill,
-      FloodFillRequest(
-        rawRgbaBytes: baseRaw,
-        borderMask: pixelEngine.borderMask,
-        x: pixelX,
-        y: pixelY,
-        width: _rawWidth,
-        height: _rawHeight,
-        fillR: _to8Bit(selectedColor.r),
-        fillG: _to8Bit(selectedColor.g),
-        fillB: _to8Bit(selectedColor.b),
-      ),
-    );
-
-    _rawFillBytes = rawResult;
-    pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
-
-    final ui.Image newUiImage = await _rawRgbaToUiImage(
-      rawResult,
-      _rawWidth,
-      _rawHeight,
-    );
-    if (!mounted) {
-      newUiImage.dispose();
-      return;
-    }
-
-    final ui.Image? oldImage = _uiImage;
-    setState(() {
-      _uiImage = newUiImage;
-      isProcessing = false;
-    });
-    oldImage?.dispose();
   }
 
   Future<void> _undo() async {
     if (_undoStack.isEmpty || isProcessing) return;
 
     setState(() => isProcessing = true);
-    final Uint8List? snapshot = _undoStack.removeLast();
+    try {
+      final Uint8List? snapshot = _undoStack.removeLast();
 
-    ui.Image restoredImage;
-    if (snapshot == null) {
-      final Uint8List originalRaw = pixelEngine.originalRawRgba;
-      _rawFillBytes = null;
-      pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
-      restoredImage = await _rawRgbaToUiImage(
-        originalRaw,
-        _rawWidth,
-        _rawHeight,
+      ui.Image restoredImage;
+      if (snapshot == null) {
+        final Uint8List originalRaw = pixelEngine.originalRawRgba;
+        _rawFillBytes = null;
+        pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
+        restoredImage = await _rawRgbaToUiImage(
+          originalRaw,
+          _rawWidth,
+          _rawHeight,
+        );
+      } else {
+        _rawFillBytes = snapshot;
+        pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
+        restoredImage = await _rawRgbaToUiImage(
+          snapshot,
+          _rawWidth,
+          _rawHeight,
+        );
+      }
+
+      _imageStateCache[currentImageIndex] = _ImageSessionState(
+        rawFillBytes: _rawFillBytes,
+        fillCount: _fillCount,
+        rawWidth: _rawWidth,
+        rawHeight: _rawHeight,
       );
-    } else {
-      _rawFillBytes = snapshot;
-      pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
-      restoredImage = await _rawRgbaToUiImage(snapshot, _rawWidth, _rawHeight);
-    }
 
-    if (!mounted) {
-      restoredImage.dispose();
-      return;
-    }
+      if (!mounted) {
+        restoredImage.dispose();
+        return;
+      }
 
-    final ui.Image? oldImage = _uiImage;
-    setState(() {
-      _uiImage = restoredImage;
-      isProcessing = false;
-    });
-    oldImage?.dispose();
+      final ui.Image? oldImage = _uiImage;
+      setState(() {
+        _uiImage = restoredImage;
+        isProcessing = false;
+      });
+      oldImage?.dispose();
+      _requestAutosave();
+    } catch (e) {
+      _log('UNDO', 'ERROR: $e');
+      if (mounted) {
+        setState(() => isProcessing = false);
+      }
+    }
+  }
+
+  Future<void> _refreshCurrentImage() async {
+    if (isProcessing) return;
+    try {
+      final File metaFile = _imageMetaFile(currentImageIndex);
+      final File rawFile = _imageRawFile(currentImageIndex);
+      if (await metaFile.exists()) await metaFile.delete();
+      if (await rawFile.exists()) await rawFile.delete();
+      _imageStateCache.remove(currentImageIndex);
+    } catch (e) {
+      _log('REFRESH', 'ERROR: $e');
+    }
+    await loadImage(restoreSavedState: false);
+    _requestAutosave(immediate: true);
   }
 
   @override
@@ -369,7 +683,7 @@ class _BasicScreenState extends State<BasicScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.refresh, color: Colors.black),
-            onPressed: loadImage,
+            onPressed: isProcessing ? null : _refreshCurrentImage,
           ),
           IconButton(
             icon: Icon(Icons.colorize, color: selectedColor),
@@ -473,7 +787,7 @@ class _BasicScreenState extends State<BasicScreen> {
                   style: TextStyle(
                     fontWeight: FontWeight.w900,
                     fontSize: 12,
-                    color: ui.Color.fromARGB(255, 0, 0, 0),
+                    color: Colors.black54,
                   ),
                 ),
                 _navBtn(Icons.arrow_forward_ios, () => _changeImage(1)),
@@ -498,6 +812,20 @@ class _BasicScreenState extends State<BasicScreen> {
 
   Widget _buildColorCircle(Color color) {
     final bool isSelected = selectedColor == color;
+
+    // 1. CALCULATE BRIGHTNESS
+    // computeLuminance() returns a value from 0.0 (Black) to 1.0 (White)
+    final double luminance = color.computeLuminance();
+
+    // 2. DEFINE CONTRAST COLORS
+    // If luminance is > 0.5, it means the color is "Light"
+    final Color selectedBorderColor = luminance < 0.5
+        ? Colors.white
+        : Colors.black;
+
+    // This variable determines the color of the Icon
+    final Color checkColor = selectedBorderColor;
+
     return GestureDetector(
       onTap: () => setState(() => selectedColor = color),
       child: AnimatedContainer(
@@ -507,21 +835,23 @@ class _BasicScreenState extends State<BasicScreen> {
         decoration: BoxDecoration(
           color: color,
           shape: BoxShape.circle,
+          // Remove Shadow (Glow effect removed)
+          boxShadow: null,
           border: Border.all(
-            color: isSelected
-                ? Colors.blueAccent
-                : const ui.Color.fromARGB(255, 0, 0, 0),
-            width: 3,
+            // Logic: Black if not selected, high-contrast if selected.
+            color: isSelected ? selectedBorderColor : Colors.black,
+            width: isSelected ? 2.0 : 2.5,
           ),
         ),
         child: isSelected
-            ? const Icon(Icons.check, color: Colors.white, size: 20)
+            ? Icon(Icons.check, color: checkColor, size: 20)
             : null,
       ),
     );
   }
 
   void _changeImage(int delta) {
+    _requestAutosave(immediate: true);
     setState(() {
       currentImageIndex =
           (currentImageIndex + delta + testImages.length) % testImages.length;

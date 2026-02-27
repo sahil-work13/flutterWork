@@ -1,11 +1,10 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 import '../engine/PixelEngine.dart';
 
@@ -33,22 +32,6 @@ class _SessionSnapshot {
   });
 }
 
-class _ImageSessionState {
-  final Uint8List? rawFillBytes;
-  final int fillCount;
-  final int rawWidth;
-  final int rawHeight;
-  final List<Uint8List?> undoStack;
-
-  const _ImageSessionState({
-    required this.rawFillBytes,
-    required this.fillCount,
-    required this.rawWidth,
-    required this.rawHeight,
-    required this.undoStack,
-  });
-}
-
 class _SessionMetaSnapshot {
   final int currentImageIndex;
   final int selectedColorValue;
@@ -67,7 +50,11 @@ class BasicScreen extends StatefulWidget {
 }
 
 class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
-  static const String _sessionNamespace = 'coloring_book_session_v1';
+  final String _sessionNamespace = 'coloring_book_session_v1';
+  final String _sessionMetaKey = 'session_meta';
+  final String _imageMetaKeyPrefix = 'image_meta_';
+  final String _preparedMetaKeyPrefix = 'prepared_meta_';
+  final String _metaBoxSuffix = '_metadata_box';
   final PixelEngine pixelEngine = PixelEngine();
   final TransformationController _transformationController =
       TransformationController();
@@ -79,7 +66,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   int _rawHeight = 0;
 
   final List<Uint8List?> _undoStack = <Uint8List?>[];
-  static const int _maxUndoSteps = 20;
+  final int _maxUndoSteps = 20;
 
   int _fillCount = 0;
   Color selectedColor = const Color(0xFFFFC107);
@@ -88,15 +75,17 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   bool _engineReady = false;
   bool _showStartupLoader = true;
   int _imageLoadSeq = 0;
+  bool _isImageLoading = false;
+  int _queuedImageDelta = 0;
   bool _isPersisting = false;
   final Map<int, _SessionSnapshot> _pendingImageSnapshots =
       <int, _SessionSnapshot>{};
   _SessionMetaSnapshot? _pendingSessionMeta;
-  Directory _sessionDirectory = Directory.systemTemp;
+  Directory _sessionDirectory = Directory.current;
+  Box<dynamic>? _sessionMetaBox;
+  bool _storageReady = false;
   Timer? _autosaveTimer;
-  static const Duration _autosaveDebounce = Duration(milliseconds: 350);
-  final Map<int, _ImageSessionState> _imageStateCache =
-      <int, _ImageSessionState>{};
+  final Duration _autosaveDebounce = const Duration(milliseconds: 350);
 
   Size _containerSize = Size.zero;
   double _cachedScaleFit = 1.0;
@@ -107,8 +96,11 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   Offset? _pointerDownPosition;
   int _pointerDownTimeMs = 0;
   bool _pointerDragged = false;
-  static const double _tapMoveThreshold = 10.0;
-  static const int _tapMaxDurationMs = 250;
+  final double _tapMoveThreshold = 10.0;
+  final int _tapMaxDurationMs = 250;
+  final double _swipeMinDistance = 64.0;
+  final double _swipeMaxCrossAxis = 42.0;
+  final int _swipeMaxDurationMs = 450;
 
   int _to8Bit(double channel) {
     final int scaled = (channel * 255.0).round();
@@ -153,7 +145,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _autosaveTimer?.cancel();
-    unawaited(_scheduleSessionSave());
+    unawaited(_flushStorageOnDispose());
     _uiImage?.dispose();
     super.dispose();
   }
@@ -169,7 +161,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
   Future<void> _prepareStorageAndInit() async {
     try {
-      final Directory appSupportDir = await getApplicationSupportDirectory();
+      final Directory appSupportDir = await getApplicationDocumentsDirectory();
       final Directory sessionDir = Directory(
         '${appSupportDir.path}${Platform.pathSeparator}$_sessionNamespace',
       );
@@ -177,58 +169,28 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         await sessionDir.create(recursive: true);
       }
       _sessionDirectory = sessionDir;
+
+      Hive.init(sessionDir.path);
+      _sessionMetaBox = await Hive.openBox<dynamic>(
+        '$_sessionNamespace$_metaBoxSuffix',
+      );
+      _storageReady = true;
     } catch (e) {
       _log('STORAGE_INIT', 'ERROR: $e');
-      _sessionDirectory = Directory.systemTemp;
+      _storageReady = false;
     }
 
-    await _migrateLegacySessionIfNeeded();
     await _initWithRestore();
   }
 
-  Future<void> _migrateLegacySessionIfNeeded() async {
-    try {
-      final File newSessionMeta = _sessionMetaFile;
-      if (await newSessionMeta.exists()) return;
-
-      final Directory legacyDir = Directory.systemTemp;
-      final List<FileSystemEntity> legacyFiles = await legacyDir
-          .list()
-          .toList();
-      final String prefix = _sessionNamespace;
-      bool copiedAny = false;
-
-      for (final FileSystemEntity entity in legacyFiles) {
-        if (entity is! File) continue;
-
-        final String fileName = entity.uri.pathSegments.isNotEmpty
-            ? entity.uri.pathSegments.last
-            : '';
-        if (!fileName.startsWith(prefix)) continue;
-
-        final File target = File(
-          '${_sessionDirectory.path}${Platform.pathSeparator}$fileName',
-        );
-        if (await target.exists()) continue;
-        await entity.copy(target.path);
-        copiedAny = true;
-      }
-
-      if (copiedAny) {
-        _log('STORAGE_MIGRATION', 'Migrated legacy session files from temp.');
-      }
-    } catch (e) {
-      _log('STORAGE_MIGRATION', 'ERROR: $e');
-    }
+  Future<void> _flushStorageOnDispose() async {
+    if (!_storageReady) return;
+    await _scheduleSessionSave();
   }
 
-  File get _sessionMetaFile => File(
-    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.json',
-  );
-
-  File _imageMetaFile(int imageIndex) => File(
-    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.json',
-  );
+  String _imageMetaKey(int imageIndex) => '$_imageMetaKeyPrefix$imageIndex';
+  String _preparedMetaKey(int imageIndex) =>
+      '$_preparedMetaKeyPrefix$imageIndex';
 
   File _imageRawFile(int imageIndex) => File(
     '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.raw',
@@ -236,10 +198,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
   File _imageUndoRawFile(int imageIndex, int undoIndex) => File(
     '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_undo_$undoIndex.raw',
-  );
-
-  File _preparedMetaFile(int imageIndex) => File(
-    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.prepared_$imageIndex.json',
   );
 
   File _preparedRawFile(int imageIndex) => File(
@@ -256,19 +214,12 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     int assetByteLength,
   ) async {
     try {
-      final File metaFile = _preparedMetaFile(imageIndex);
-      final File rawFile = _preparedRawFile(imageIndex);
-      final File maskFile = _preparedMaskFile(imageIndex);
-
-      if (!await metaFile.exists() ||
-          !await rawFile.exists() ||
-          !await maskFile.exists()) {
-        return null;
-      }
-
-      final String text = await metaFile.readAsString();
-      final Map<String, dynamic> meta =
-          jsonDecode(text) as Map<String, dynamic>;
+      if (!_storageReady || _sessionMetaBox == null) return null;
+      final dynamic rawMeta = _sessionMetaBox!.get(
+        _preparedMetaKey(imageIndex),
+      );
+      if (rawMeta is! Map) return null;
+      final Map<dynamic, dynamic> meta = rawMeta;
       if (meta['version'] != 1) return null;
       if (meta['assetPath'] != assetPath) return null;
       if (meta['assetByteLength'] != assetByteLength) return null;
@@ -276,6 +227,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       final int width = (meta['width'] is int) ? meta['width'] as int : 0;
       final int height = (meta['height'] is int) ? meta['height'] as int : 0;
       if (width <= 0 || height <= 0) return null;
+
+      final File rawFile = _preparedRawFile(imageIndex);
+      final File maskFile = _preparedMaskFile(imageIndex);
+      if (!await rawFile.exists() || !await maskFile.exists()) return null;
 
       final Uint8List raw = await rawFile.readAsBytes();
       final Uint8List borderMask = await maskFile.readAsBytes();
@@ -304,6 +259,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     Map<String, Object> prepared,
   ) async {
     try {
+      if (!_storageReady || _sessionMetaBox == null) return;
       final int width = prepared['width'] as int;
       final int height = prepared['height'] as int;
       final Uint8List raw = prepared['raw'] as Uint8List;
@@ -319,17 +275,16 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
       await _preparedRawFile(imageIndex).writeAsBytes(raw, flush: true);
       await _preparedMaskFile(imageIndex).writeAsBytes(borderMask, flush: true);
-      final Map<String, dynamic> meta = <String, dynamic>{
-        'version': 1,
-        'assetPath': assetPath,
-        'assetByteLength': assetByteLength,
-        'width': width,
-        'height': height,
-        'savedAt': DateTime.now().toIso8601String(),
-      };
-      await _preparedMetaFile(
-        imageIndex,
-      ).writeAsString(jsonEncode(meta), flush: true);
+      await _sessionMetaBox!
+          .put(_preparedMetaKey(imageIndex), <String, dynamic>{
+            'version': 1,
+            'imageId': imageIndex,
+            'assetPath': assetPath,
+            'assetByteLength': assetByteLength,
+            'width': width,
+            'height': height,
+            'lastModified': DateTime.now().toIso8601String(),
+          });
     } catch (e) {
       _log('PREPARED_CACHE_WRITE', 'ERROR: $e');
     }
@@ -346,18 +301,34 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       assetPath,
       byteLength,
     );
-    if (cached != null) {
-      return cached;
-    }
+    if (cached != null) return cached;
 
-    final Map<String, Object> generated = await compute(
-      PixelEngine.decodeAndPrepare,
-      bytes,
-    );
+    final Map<String, Object> generated = PixelEngine.decodeAndPrepare(bytes);
     unawaited(
       _writePreparedImageCache(imageIndex, assetPath, byteLength, generated),
     );
     return generated;
+  }
+
+  int _wrapImageIndex(int rawIndex) {
+    final int len = testImages.length;
+    return ((rawIndex % len) + len) % len;
+  }
+
+  void _drainQueuedImageChange() {
+    if (!mounted || _isImageLoading || _queuedImageDelta == 0) return;
+    final int queuedDelta = _queuedImageDelta;
+    _queuedImageDelta = 0;
+    _applyImageChange(queuedDelta);
+  }
+
+  void _applyImageChange(int delta) {
+    if (delta == 0) return;
+    _requestAutosave(immediate: true);
+    setState(() {
+      currentImageIndex = _wrapImageIndex(currentImageIndex + delta);
+    });
+    unawaited(loadImage());
   }
 
   Future<void> _initWithRestore() async {
@@ -367,11 +338,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
   Future<bool> _restoreSessionIfAvailable() async {
     try {
-      if (!await _sessionMetaFile.exists()) return false;
-
-      final String text = await _sessionMetaFile.readAsString();
-      final Map<String, dynamic> meta =
-          jsonDecode(text) as Map<String, dynamic>;
+      if (!_storageReady || _sessionMetaBox == null) return false;
+      final dynamic rawMeta = _sessionMetaBox!.get(_sessionMetaKey);
+      if (rawMeta is! Map) return false;
+      final Map<dynamic, dynamic> meta = rawMeta;
 
       final int restoredIndex = (meta['currentImageIndex'] is int)
           ? meta['currentImageIndex'] as int
@@ -462,18 +432,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
   Future<void> _persistImageSnapshot(_SessionSnapshot snapshot) async {
     try {
+      if (!_storageReady || _sessionMetaBox == null) return;
       if (snapshot.rawWidth <= 0 || snapshot.rawHeight <= 0) return;
 
-      final File imageMetaFile = _imageMetaFile(snapshot.imageIndex);
       final File imageRawFile = _imageRawFile(snapshot.imageIndex);
-
-      _imageStateCache[snapshot.imageIndex] = _ImageSessionState(
-        rawFillBytes: snapshot.rawFillBytes,
-        fillCount: snapshot.fillCount,
-        rawWidth: snapshot.rawWidth,
-        rawHeight: snapshot.rawHeight,
-        undoStack: List<Uint8List?>.from(snapshot.undoStack),
-      );
 
       if (snapshot.rawFillBytes != null) {
         await imageRawFile.writeAsBytes(snapshot.rawFillBytes!, flush: true);
@@ -502,17 +464,21 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         ).writeAsBytes(entry, flush: true);
       }
 
+      final DateTime now = DateTime.now();
       final Map<String, dynamic> imageMeta = <String, dynamic>{
-        'version': 1,
-        'imageIndex': snapshot.imageIndex,
+        'version': 2,
+        'imageId': snapshot.imageIndex,
         'fillCount': snapshot.fillCount,
         'hasRawFill': snapshot.rawFillBytes != null,
         'rawWidth': snapshot.rawWidth,
         'rawHeight': snapshot.rawHeight,
         'undoKinds': undoKinds,
-        'savedAt': DateTime.now().toIso8601String(),
+        'undoStackPointer': snapshot.undoStack.isEmpty
+            ? -1
+            : snapshot.undoStack.length - 1,
+        'lastModified': now.toIso8601String(),
       };
-      await imageMetaFile.writeAsString(jsonEncode(imageMeta), flush: true);
+      await _sessionMetaBox!.put(_imageMetaKey(snapshot.imageIndex), imageMeta);
     } catch (e) {
       _log('AUTOSAVE_IMAGE', 'ERROR: $e');
     }
@@ -522,44 +488,33 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     _SessionMetaSnapshot snapshot,
   ) async {
     try {
+      if (!_storageReady || _sessionMetaBox == null) return;
       final Map<String, dynamic> sessionMeta = <String, dynamic>{
-        'version': 1,
+        'version': 2,
         'currentImageIndex': snapshot.currentImageIndex,
         'selectedColor': snapshot.selectedColorValue,
-        'savedAt': DateTime.now().toIso8601String(),
+        'lastModified': DateTime.now().toIso8601String(),
       };
-      await _sessionMetaFile.writeAsString(
-        jsonEncode(sessionMeta),
-        flush: true,
-      );
+      await _sessionMetaBox!.put(_sessionMetaKey, sessionMeta);
     } catch (e) {
       _log('AUTOSAVE_META', 'ERROR: $e');
     }
   }
 
   Future<ui.Image?> _buildCurrentImageFromSavedState() async {
-    final _ImageSessionState? cached = _imageStateCache[currentImageIndex];
-    if (cached != null &&
-        cached.rawWidth == _rawWidth &&
-        cached.rawHeight == _rawHeight) {
-      _fillCount = cached.fillCount;
-      _rawFillBytes = cached.rawFillBytes;
-      _undoStack
-        ..clear()
-        ..addAll(cached.undoStack);
-      if (_rawFillBytes != null) {
-        pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
-        return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
-      }
+    if (!_storageReady || _sessionMetaBox == null) {
+      _rawFillBytes = null;
+      _fillCount = 0;
+      _undoStack.clear();
       return null;
     }
 
-    final File imageMetaFile = _imageMetaFile(currentImageIndex);
-    if (await imageMetaFile.exists()) {
+    final dynamic rawMeta = _sessionMetaBox!.get(
+      _imageMetaKey(currentImageIndex),
+    );
+    if (rawMeta is Map) {
       try {
-        final String text = await imageMetaFile.readAsString();
-        final Map<String, dynamic> meta =
-            jsonDecode(text) as Map<String, dynamic>;
+        final Map<dynamic, dynamic> meta = rawMeta;
 
         _fillCount = (meta['fillCount'] is int) ? meta['fillCount'] as int : 0;
         final bool hasRawFill = meta['hasRawFill'] == true;
@@ -574,6 +529,9 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                   .map((dynamic e) => (e is int) ? e : -1)
                   .toList()
             : <int>[];
+        final int undoStackPointer = (meta['undoStackPointer'] is int)
+            ? meta['undoStackPointer'] as int
+            : undoKinds.length - 1;
 
         final List<Uint8List?> restoredUndo = <Uint8List?>[];
         for (int i = 0; i < undoKinds.length; i++) {
@@ -590,6 +548,9 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
               restoredUndo.add(rawUndo);
             }
           }
+        }
+        if (undoStackPointer >= 0 && undoStackPointer < restoredUndo.length) {
+          restoredUndo.removeRange(undoStackPointer + 1, restoredUndo.length);
         }
         _undoStack
           ..clear()
@@ -609,13 +570,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                 _rawWidth,
                 _rawHeight,
               );
-              _imageStateCache[currentImageIndex] = _ImageSessionState(
-                rawFillBytes: _rawFillBytes,
-                fillCount: _fillCount,
-                rawWidth: _rawWidth,
-                rawHeight: _rawHeight,
-                undoStack: List<Uint8List?>.from(_undoStack),
-              );
               return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
             }
           }
@@ -627,13 +581,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
     _rawFillBytes = null;
     _fillCount = 0;
-    _imageStateCache[currentImageIndex] = _ImageSessionState(
-      rawFillBytes: null,
-      fillCount: 0,
-      rawWidth: _rawWidth,
-      rawHeight: _rawHeight,
-      undoStack: <Uint8List?>[],
-    );
     _undoStack.clear();
     return null;
   }
@@ -642,6 +589,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     final int loadSeq = ++_imageLoadSeq;
     final int imageIndexAtLoad = currentImageIndex;
     final String assetPathAtLoad = testImages[imageIndexAtLoad];
+    _isImageLoading = true;
     if (mounted) {
       setState(() {
         _engineReady = false;
@@ -653,12 +601,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       if (!mounted || loadSeq != _imageLoadSeq) return;
       final Uint8List bytes = data.buffer.asUint8List();
 
-      // Start light preview decode and heavy pixel preparation in parallel.
-      final Future<ui.Image> previewFuture = _decodeToUiImage(bytes);
-      final Future<Map<String, Object>> preparedFuture =
-          _loadOrPrepareImageData(imageIndexAtLoad, assetPathAtLoad, bytes);
-
-      final ui.Image preview = await previewFuture;
+      final ui.Image preview = await _decodeToUiImage(bytes);
       if (!mounted || loadSeq != _imageLoadSeq) {
         preview.dispose();
         return;
@@ -675,7 +618,14 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       oldPreview?.dispose();
       _updateFitCache();
 
-      final Map<String, Object> prepared = await preparedFuture;
+      await Future<void>.delayed(Duration.zero);
+      if (!mounted || loadSeq != _imageLoadSeq) return;
+
+      final Map<String, Object> prepared = await _loadOrPrepareImageData(
+        imageIndexAtLoad,
+        assetPathAtLoad,
+        bytes,
+      );
       if (!mounted || loadSeq != _imageLoadSeq) return;
 
       pixelEngine.applyPreparedImage(prepared);
@@ -699,13 +649,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         _rawFillBytes = null;
         _fillCount = 0;
         _undoStack.clear();
-        _imageStateCache[currentImageIndex] = _ImageSessionState(
-          rawFillBytes: null,
-          fillCount: 0,
-          rawWidth: _rawWidth,
-          rawHeight: _rawHeight,
-          undoStack: <Uint8List?>[],
-        );
       }
 
       if (loaded != null) {
@@ -731,6 +674,11 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
           _showStartupLoader = false;
         });
       }
+    } finally {
+      if (loadSeq == _imageLoadSeq) {
+        _isImageLoading = false;
+      }
+      _drainQueuedImageChange();
     }
   }
 
@@ -776,6 +724,12 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     _cachedFitOffsetY = (viewH - imgH * _cachedScaleFit) / 2.0;
   }
 
+  bool _isSwipeNavigationAllowed() {
+    final double currentScale = _transformationController.value
+        .getMaxScaleOnAxis();
+    return currentScale <= 1.05;
+  }
+
   void showPicker() {
     showDialog<void>(
       context: context,
@@ -819,12 +773,19 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
   void _onPointerUp(PointerUpEvent event) {
     _activePointers = (_activePointers - 1).clamp(0, 10);
-    if (_pointerDownPosition != null &&
-        !_pointerDragged &&
-        _activePointers == 0) {
+    if (_pointerDownPosition != null && _activePointers == 0) {
       final int elapsed =
           DateTime.now().millisecondsSinceEpoch - _pointerDownTimeMs;
-      if (elapsed <= _tapMaxDurationMs) {
+      final Offset delta = event.localPosition - _pointerDownPosition!;
+      final bool isHorizontalSwipe =
+          _isSwipeNavigationAllowed() &&
+          elapsed <= _swipeMaxDurationMs &&
+          delta.dx.abs() >= _swipeMinDistance &&
+          delta.dy.abs() <= _swipeMaxCrossAxis;
+
+      if (isHorizontalSwipe) {
+        _changeImage(delta.dx < 0 ? 1 : -1);
+      } else if (!_pointerDragged && elapsed <= _tapMaxDurationMs) {
         handleTap(_pointerDownPosition!);
       }
     }
@@ -886,8 +847,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
       final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
 
-      final Uint8List rawResult = await compute(
-        PixelEngine.processFloodFill,
+      final Uint8List rawResult = PixelEngine.processFloodFill(
         FloodFillRequest(
           rawRgbaBytes: baseRaw,
           borderMask: pixelEngine.borderMask,
@@ -903,13 +863,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
       _rawFillBytes = rawResult;
       pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
-      _imageStateCache[currentImageIndex] = _ImageSessionState(
-        rawFillBytes: _rawFillBytes,
-        fillCount: _fillCount,
-        rawWidth: _rawWidth,
-        rawHeight: _rawHeight,
-        undoStack: List<Uint8List?>.from(_undoStack),
-      );
 
       final ui.Image newUiImage = await _rawRgbaToUiImage(
         rawResult,
@@ -964,14 +917,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         );
       }
 
-      _imageStateCache[currentImageIndex] = _ImageSessionState(
-        rawFillBytes: _rawFillBytes,
-        fillCount: _fillCount,
-        rawWidth: _rawWidth,
-        rawHeight: _rawHeight,
-        undoStack: List<Uint8List?>.from(_undoStack),
-      );
-
       if (!mounted) {
         restoredImage.dispose();
         return;
@@ -995,17 +940,19 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   Future<void> _refreshCurrentImage() async {
     if (isProcessing) return;
     try {
-      final File metaFile = _imageMetaFile(currentImageIndex);
-      final File rawFile = _imageRawFile(currentImageIndex);
-      if (await metaFile.exists()) await metaFile.delete();
-      if (await rawFile.exists()) await rawFile.delete();
-      for (int i = 0; i < _maxUndoSteps; i++) {
-        final File undoFile = _imageUndoRawFile(currentImageIndex, i);
-        if (await undoFile.exists()) {
-          await undoFile.delete();
+      if (_storageReady) {
+        final File rawFile = _imageRawFile(currentImageIndex);
+        if (_sessionMetaBox != null) {
+          await _sessionMetaBox!.delete(_imageMetaKey(currentImageIndex));
+        }
+        if (await rawFile.exists()) await rawFile.delete();
+        for (int i = 0; i < _maxUndoSteps; i++) {
+          final File undoFile = _imageUndoRawFile(currentImageIndex, i);
+          if (await undoFile.exists()) {
+            await undoFile.delete();
+          }
         }
       }
-      _imageStateCache.remove(currentImageIndex);
     } catch (e) {
       _log('REFRESH', 'ERROR: $e');
     }
@@ -1262,12 +1209,12 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   }
 
   void _changeImage(int delta) {
-    _requestAutosave(immediate: true);
-    setState(() {
-      currentImageIndex =
-          (currentImageIndex + delta + testImages.length) % testImages.length;
-    });
-    loadImage();
+    if (delta == 0) return;
+    if (_isImageLoading) {
+      _queuedImageDelta += delta;
+      return;
+    }
+    _applyImageChange(delta);
   }
 
   Widget _navBtn(IconData icon, VoidCallback tap) {

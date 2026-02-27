@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:path_provider/path_provider.dart';
 import '../engine/PixelEngine.dart';
 
 void _log(String tag, String msg) {
@@ -48,6 +49,16 @@ class _ImageSessionState {
   });
 }
 
+class _SessionMetaSnapshot {
+  final int currentImageIndex;
+  final int selectedColorValue;
+
+  const _SessionMetaSnapshot({
+    required this.currentImageIndex,
+    required this.selectedColorValue,
+  });
+}
+
 class BasicScreen extends StatefulWidget {
   const BasicScreen({super.key});
 
@@ -74,8 +85,14 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   Color selectedColor = const Color(0xFFFFC107);
   bool isProcessing = false;
   int currentImageIndex = 0;
+  bool _engineReady = false;
+  bool _showStartupLoader = true;
+  int _imageLoadSeq = 0;
   bool _isPersisting = false;
-  _SessionSnapshot? _pendingSnapshot;
+  final Map<int, _SessionSnapshot> _pendingImageSnapshots =
+      <int, _SessionSnapshot>{};
+  _SessionMetaSnapshot? _pendingSessionMeta;
+  Directory _sessionDirectory = Directory.systemTemp;
   Timer? _autosaveTimer;
   static const Duration _autosaveDebounce = Duration(milliseconds: 350);
   final Map<int, _ImageSessionState> _imageStateCache =
@@ -126,7 +143,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initWithRestore();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_prepareStorageAndInit());
+    });
   }
 
   @override
@@ -147,28 +167,201 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _prepareStorageAndInit() async {
+    try {
+      final Directory appSupportDir = await getApplicationSupportDirectory();
+      final Directory sessionDir = Directory(
+        '${appSupportDir.path}${Platform.pathSeparator}$_sessionNamespace',
+      );
+      if (!await sessionDir.exists()) {
+        await sessionDir.create(recursive: true);
+      }
+      _sessionDirectory = sessionDir;
+    } catch (e) {
+      _log('STORAGE_INIT', 'ERROR: $e');
+      _sessionDirectory = Directory.systemTemp;
+    }
+
+    await _migrateLegacySessionIfNeeded();
+    await _initWithRestore();
+  }
+
+  Future<void> _migrateLegacySessionIfNeeded() async {
+    try {
+      final File newSessionMeta = _sessionMetaFile;
+      if (await newSessionMeta.exists()) return;
+
+      final Directory legacyDir = Directory.systemTemp;
+      final List<FileSystemEntity> legacyFiles = await legacyDir
+          .list()
+          .toList();
+      final String prefix = _sessionNamespace;
+      bool copiedAny = false;
+
+      for (final FileSystemEntity entity in legacyFiles) {
+        if (entity is! File) continue;
+
+        final String fileName = entity.uri.pathSegments.isNotEmpty
+            ? entity.uri.pathSegments.last
+            : '';
+        if (!fileName.startsWith(prefix)) continue;
+
+        final File target = File(
+          '${_sessionDirectory.path}${Platform.pathSeparator}$fileName',
+        );
+        if (await target.exists()) continue;
+        await entity.copy(target.path);
+        copiedAny = true;
+      }
+
+      if (copiedAny) {
+        _log('STORAGE_MIGRATION', 'Migrated legacy session files from temp.');
+      }
+    } catch (e) {
+      _log('STORAGE_MIGRATION', 'ERROR: $e');
+    }
+  }
+
   File get _sessionMetaFile => File(
-    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.json',
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.json',
   );
 
   File _imageMetaFile(int imageIndex) => File(
-    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.json',
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.json',
   );
 
   File _imageRawFile(int imageIndex) => File(
-    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.raw',
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_$imageIndex.raw',
   );
 
   File _imageUndoRawFile(int imageIndex, int undoIndex) => File(
-    '${Directory.systemTemp.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_undo_$undoIndex.raw',
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_undo_$undoIndex.raw',
   );
 
-  Future<void> _initWithRestore() async {
-    final bool restored = await _restoreSessionIfAvailable();
-    if (!restored) {
-      await loadImage();
-      return;
+  File _preparedMetaFile(int imageIndex) => File(
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.prepared_$imageIndex.json',
+  );
+
+  File _preparedRawFile(int imageIndex) => File(
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.prepared_$imageIndex.raw',
+  );
+
+  File _preparedMaskFile(int imageIndex) => File(
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.prepared_$imageIndex.mask',
+  );
+
+  Future<Map<String, Object>?> _readPreparedImageCache(
+    int imageIndex,
+    String assetPath,
+    int assetByteLength,
+  ) async {
+    try {
+      final File metaFile = _preparedMetaFile(imageIndex);
+      final File rawFile = _preparedRawFile(imageIndex);
+      final File maskFile = _preparedMaskFile(imageIndex);
+
+      if (!await metaFile.exists() ||
+          !await rawFile.exists() ||
+          !await maskFile.exists()) {
+        return null;
+      }
+
+      final String text = await metaFile.readAsString();
+      final Map<String, dynamic> meta =
+          jsonDecode(text) as Map<String, dynamic>;
+      if (meta['version'] != 1) return null;
+      if (meta['assetPath'] != assetPath) return null;
+      if (meta['assetByteLength'] != assetByteLength) return null;
+
+      final int width = (meta['width'] is int) ? meta['width'] as int : 0;
+      final int height = (meta['height'] is int) ? meta['height'] as int : 0;
+      if (width <= 0 || height <= 0) return null;
+
+      final Uint8List raw = await rawFile.readAsBytes();
+      final Uint8List borderMask = await maskFile.readAsBytes();
+      final int pixelCount = width * height;
+      if (raw.lengthInBytes != pixelCount * 4 ||
+          borderMask.lengthInBytes != pixelCount) {
+        return null;
+      }
+
+      return <String, Object>{
+        'width': width,
+        'height': height,
+        'raw': raw,
+        'borderMask': borderMask,
+      };
+    } catch (e) {
+      _log('PREPARED_CACHE_READ', 'ERROR: $e');
+      return null;
     }
+  }
+
+  Future<void> _writePreparedImageCache(
+    int imageIndex,
+    String assetPath,
+    int assetByteLength,
+    Map<String, Object> prepared,
+  ) async {
+    try {
+      final int width = prepared['width'] as int;
+      final int height = prepared['height'] as int;
+      final Uint8List raw = prepared['raw'] as Uint8List;
+      final Uint8List borderMask = prepared['borderMask'] as Uint8List;
+      if (width <= 0 ||
+          height <= 0 ||
+          raw.isEmpty ||
+          borderMask.isEmpty ||
+          raw.lengthInBytes != width * height * 4 ||
+          borderMask.lengthInBytes != width * height) {
+        return;
+      }
+
+      await _preparedRawFile(imageIndex).writeAsBytes(raw, flush: true);
+      await _preparedMaskFile(imageIndex).writeAsBytes(borderMask, flush: true);
+      final Map<String, dynamic> meta = <String, dynamic>{
+        'version': 1,
+        'assetPath': assetPath,
+        'assetByteLength': assetByteLength,
+        'width': width,
+        'height': height,
+        'savedAt': DateTime.now().toIso8601String(),
+      };
+      await _preparedMetaFile(
+        imageIndex,
+      ).writeAsString(jsonEncode(meta), flush: true);
+    } catch (e) {
+      _log('PREPARED_CACHE_WRITE', 'ERROR: $e');
+    }
+  }
+
+  Future<Map<String, Object>> _loadOrPrepareImageData(
+    int imageIndex,
+    String assetPath,
+    Uint8List bytes,
+  ) async {
+    final int byteLength = bytes.lengthInBytes;
+    final Map<String, Object>? cached = await _readPreparedImageCache(
+      imageIndex,
+      assetPath,
+      byteLength,
+    );
+    if (cached != null) {
+      return cached;
+    }
+
+    final Map<String, Object> generated = await compute(
+      PixelEngine.decodeAndPrepare,
+      bytes,
+    );
+    unawaited(
+      _writePreparedImageCache(imageIndex, assetPath, byteLength, generated),
+    );
+    return generated;
+  }
+
+  Future<void> _initWithRestore() async {
+    await _restoreSessionIfAvailable();
     await loadImage();
   }
 
@@ -209,6 +402,21 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     );
   }
 
+  _SessionMetaSnapshot _captureSessionMetaSnapshot() {
+    return _SessionMetaSnapshot(
+      currentImageIndex: currentImageIndex,
+      selectedColorValue: selectedColor.toARGB32(),
+    );
+  }
+
+  void _enqueueAutosaveSnapshot() {
+    final _SessionSnapshot imageSnapshot = _captureSessionSnapshot();
+    if (imageSnapshot.rawWidth > 0 && imageSnapshot.rawHeight > 0) {
+      _pendingImageSnapshots[imageSnapshot.imageIndex] = imageSnapshot;
+    }
+    _pendingSessionMeta = _captureSessionMetaSnapshot();
+  }
+
   void _requestAutosave({bool immediate = false}) {
     if (immediate) {
       _autosaveTimer?.cancel();
@@ -223,25 +431,36 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _scheduleSessionSave() async {
-    final _SessionSnapshot snapshot = _captureSessionSnapshot();
-    if (_isPersisting) {
-      _pendingSnapshot = snapshot;
-      return;
-    }
+    _enqueueAutosaveSnapshot();
+    if (_isPersisting) return;
 
     _isPersisting = true;
-    _SessionSnapshot current = snapshot;
-    while (true) {
-      await _persistSessionSnapshot(current);
-      final _SessionSnapshot? pending = _pendingSnapshot;
-      if (pending == null) break;
-      _pendingSnapshot = null;
-      current = pending;
+    try {
+      while (true) {
+        while (_pendingImageSnapshots.isNotEmpty) {
+          final int imageIndex = _pendingImageSnapshots.keys.first;
+          final _SessionSnapshot snapshot = _pendingImageSnapshots.remove(
+            imageIndex,
+          )!;
+          await _persistImageSnapshot(snapshot);
+        }
+
+        final _SessionMetaSnapshot? sessionMeta = _pendingSessionMeta;
+        _pendingSessionMeta = null;
+        if (sessionMeta != null) {
+          await _persistSessionMetaSnapshot(sessionMeta);
+        }
+
+        if (_pendingImageSnapshots.isEmpty && _pendingSessionMeta == null) {
+          break;
+        }
+      }
+    } finally {
+      _isPersisting = false;
     }
-    _isPersisting = false;
   }
 
-  Future<void> _persistSessionSnapshot(_SessionSnapshot snapshot) async {
+  Future<void> _persistImageSnapshot(_SessionSnapshot snapshot) async {
     try {
       if (snapshot.rawWidth <= 0 || snapshot.rawHeight <= 0) return;
 
@@ -257,7 +476,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       );
 
       if (snapshot.rawFillBytes != null) {
-        await imageRawFile.writeAsBytes(snapshot.rawFillBytes!);
+        await imageRawFile.writeAsBytes(snapshot.rawFillBytes!, flush: true);
       } else if (await imageRawFile.exists()) {
         await imageRawFile.delete();
       }
@@ -277,7 +496,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
           continue;
         }
         undoKinds.add(1);
-        await _imageUndoRawFile(snapshot.imageIndex, i).writeAsBytes(entry);
+        await _imageUndoRawFile(
+          snapshot.imageIndex,
+          i,
+        ).writeAsBytes(entry, flush: true);
       }
 
       final Map<String, dynamic> imageMeta = <String, dynamic>{
@@ -290,21 +512,32 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         'undoKinds': undoKinds,
         'savedAt': DateTime.now().toIso8601String(),
       };
-      await imageMetaFile.writeAsString(jsonEncode(imageMeta));
-
-      final Map<String, dynamic> sessionMeta = <String, dynamic>{
-        'version': 1,
-        'currentImageIndex': snapshot.imageIndex,
-        'selectedColor': snapshot.selectedColorValue,
-        'savedAt': DateTime.now().toIso8601String(),
-      };
-      await _sessionMetaFile.writeAsString(jsonEncode(sessionMeta));
+      await imageMetaFile.writeAsString(jsonEncode(imageMeta), flush: true);
     } catch (e) {
-      _log('AUTOSAVE', 'ERROR: $e');
+      _log('AUTOSAVE_IMAGE', 'ERROR: $e');
     }
   }
 
-  Future<ui.Image> _buildCurrentImageFromSavedState(Uint8List originalBytes) async {
+  Future<void> _persistSessionMetaSnapshot(
+    _SessionMetaSnapshot snapshot,
+  ) async {
+    try {
+      final Map<String, dynamic> sessionMeta = <String, dynamic>{
+        'version': 1,
+        'currentImageIndex': snapshot.currentImageIndex,
+        'selectedColor': snapshot.selectedColorValue,
+        'savedAt': DateTime.now().toIso8601String(),
+      };
+      await _sessionMetaFile.writeAsString(
+        jsonEncode(sessionMeta),
+        flush: true,
+      );
+    } catch (e) {
+      _log('AUTOSAVE_META', 'ERROR: $e');
+    }
+  }
+
+  Future<ui.Image?> _buildCurrentImageFromSavedState() async {
     final _ImageSessionState? cached = _imageStateCache[currentImageIndex];
     if (cached != null &&
         cached.rawWidth == _rawWidth &&
@@ -318,21 +551,24 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
         return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
       }
-      return _decodeToUiImage(originalBytes);
+      return null;
     }
 
     final File imageMetaFile = _imageMetaFile(currentImageIndex);
     if (await imageMetaFile.exists()) {
       try {
         final String text = await imageMetaFile.readAsString();
-        final Map<String, dynamic> meta = jsonDecode(text) as Map<String, dynamic>;
+        final Map<String, dynamic> meta =
+            jsonDecode(text) as Map<String, dynamic>;
 
         _fillCount = (meta['fillCount'] is int) ? meta['fillCount'] as int : 0;
         final bool hasRawFill = meta['hasRawFill'] == true;
-        final int savedWidth =
-            (meta['rawWidth'] is int) ? meta['rawWidth'] as int : _rawWidth;
-        final int savedHeight =
-            (meta['rawHeight'] is int) ? meta['rawHeight'] as int : _rawHeight;
+        final int savedWidth = (meta['rawWidth'] is int)
+            ? meta['rawWidth'] as int
+            : _rawWidth;
+        final int savedHeight = (meta['rawHeight'] is int)
+            ? meta['rawHeight'] as int
+            : _rawHeight;
         final List<int> undoKinds = (meta['undoKinds'] is List)
             ? (meta['undoKinds'] as List)
                   .map((dynamic e) => (e is int) ? e : -1)
@@ -368,7 +604,11 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
             final int expectedLen = _rawWidth * _rawHeight * 4;
             if (raw.lengthInBytes == expectedLen) {
               _rawFillBytes = raw;
-              pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
+              pixelEngine.updateFromRawBytes(
+                _rawFillBytes!,
+                _rawWidth,
+                _rawHeight,
+              );
               _imageStateCache[currentImageIndex] = _ImageSessionState(
                 rawFillBytes: _rawFillBytes,
                 fillCount: _fillCount,
@@ -395,24 +635,66 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       undoStack: <Uint8List?>[],
     );
     _undoStack.clear();
-    return _decodeToUiImage(originalBytes);
+    return null;
   }
 
   Future<void> loadImage({bool restoreSavedState = true}) async {
+    final int loadSeq = ++_imageLoadSeq;
+    final int imageIndexAtLoad = currentImageIndex;
+    final String assetPathAtLoad = testImages[imageIndexAtLoad];
+    if (mounted) {
+      setState(() {
+        _engineReady = false;
+      });
+    }
+
     try {
-      final ByteData data = await rootBundle.load(
-        testImages[currentImageIndex],
-      );
+      final ByteData data = await rootBundle.load(assetPathAtLoad);
+      if (!mounted || loadSeq != _imageLoadSeq) return;
       final Uint8List bytes = data.buffer.asUint8List();
 
-      pixelEngine.loadImage(bytes);
+      // Start light preview decode and heavy pixel preparation in parallel.
+      final Future<ui.Image> previewFuture = _decodeToUiImage(bytes);
+      final Future<Map<String, Object>> preparedFuture =
+          _loadOrPrepareImageData(imageIndexAtLoad, assetPathAtLoad, bytes);
+
+      final ui.Image preview = await previewFuture;
+      if (!mounted || loadSeq != _imageLoadSeq) {
+        preview.dispose();
+        return;
+      }
+
+      final ui.Image? oldPreview = _uiImage;
+      setState(() {
+        _uiImage = preview;
+        _rawWidth = preview.width;
+        _rawHeight = preview.height;
+        _transformationController.value = Matrix4.identity();
+        _showStartupLoader = false;
+      });
+      oldPreview?.dispose();
+      _updateFitCache();
+
+      final Map<String, Object> prepared = await preparedFuture;
+      if (!mounted || loadSeq != _imageLoadSeq) return;
+
+      pixelEngine.applyPreparedImage(prepared);
+      if (!pixelEngine.isLoaded) {
+        throw StateError('Failed to decode image: $assetPathAtLoad');
+      }
+
       _rawWidth = pixelEngine.imageWidth;
       _rawHeight = pixelEngine.imageHeight;
       _undoStack.clear();
 
-      final ui.Image loaded = restoreSavedState
-          ? await _buildCurrentImageFromSavedState(bytes)
-          : await _decodeToUiImage(bytes);
+      final ui.Image? loaded = restoreSavedState
+          ? await _buildCurrentImageFromSavedState()
+          : null;
+      if (!mounted || loadSeq != _imageLoadSeq) {
+        loaded?.dispose();
+        return;
+      }
+
       if (!restoreSavedState) {
         _rawFillBytes = null;
         _fillCount = 0;
@@ -425,20 +707,30 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
           undoStack: <Uint8List?>[],
         );
       }
-      if (!mounted) {
-        loaded.dispose();
-        return;
+
+      if (loaded != null) {
+        final ui.Image? oldImage = _uiImage;
+        setState(() {
+          _uiImage = loaded;
+          _transformationController.value = Matrix4.identity();
+        });
+        oldImage?.dispose();
+        _updateFitCache();
       }
 
-      final ui.Image? oldImage = _uiImage;
-      setState(() {
-        _uiImage = loaded;
-        _transformationController.value = Matrix4.identity();
-      });
-      oldImage?.dispose();
-      _updateFitCache();
+      if (mounted && loadSeq == _imageLoadSeq) {
+        setState(() {
+          _engineReady = true;
+        });
+      }
     } catch (e) {
       _log('LOAD', 'ERROR: $e');
+      if (mounted && loadSeq == _imageLoadSeq) {
+        setState(() {
+          _engineReady = false;
+          _showStartupLoader = false;
+        });
+      }
     }
   }
 
@@ -551,7 +843,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   }
 
   Future<void> handleTap(Offset localOffset) async {
-    if (_uiImage == null || isProcessing) return;
+    if (_uiImage == null || isProcessing || !_engineReady) return;
 
     final Offset scene = _transformationController.toScene(localOffset);
     final int pixelX = ((scene.dx - _cachedFitOffsetX) / _cachedScaleFit)
@@ -574,9 +866,9 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       _fillCount++;
       final int thisFill = _fillCount;
 
-      final Uint8List? snapshot = _rawFillBytes == null
-          ? null
-          : Uint8List.fromList(_rawFillBytes!);
+      // Each fill produces a new buffer, so the previous one is safe to reuse
+      // as an undo snapshot without cloning.
+      final Uint8List? snapshot = _rawFillBytes;
 
       if (_undoStack.length >= _maxUndoSteps) {
         if (_undoStack[0] == null) {
@@ -645,7 +937,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _undo() async {
-    if (_undoStack.isEmpty || isProcessing) return;
+    if (_undoStack.isEmpty || isProcessing || !_engineReady) return;
 
     setState(() => isProcessing = true);
     try {
@@ -723,6 +1015,13 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (_uiImage == null && _showStartupLoader) {
+      return Scaffold(
+        backgroundColor: const Color(0xFFF5F5F7),
+        body: SafeArea(child: Center(child: _buildStartupLoader())),
+      );
+    }
+
     return Scaffold(
       backgroundColor: const Color(0xFFF5F5F7),
       appBar: AppBar(
@@ -743,19 +1042,23 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
           IconButton(
             icon: Icon(
               Icons.undo,
-              color: (_undoStack.isNotEmpty && !isProcessing)
+              color: (_undoStack.isNotEmpty && !isProcessing && _engineReady)
                   ? Colors.black
                   : Colors.grey.shade300,
             ),
-            onPressed: (_undoStack.isNotEmpty && !isProcessing) ? _undo : null,
+            onPressed: (_undoStack.isNotEmpty && !isProcessing && _engineReady)
+                ? _undo
+                : null,
           ),
           IconButton(
             icon: const Icon(Icons.refresh, color: Colors.black),
-            onPressed: isProcessing ? null : _refreshCurrentImage,
+            onPressed: (isProcessing || !_engineReady)
+                ? null
+                : _refreshCurrentImage,
           ),
           IconButton(
             icon: Icon(Icons.colorize, color: selectedColor),
-            onPressed: showPicker,
+            onPressed: _engineReady ? showPicker : null,
           ),
         ],
       ),
@@ -875,6 +1178,46 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildStartupLoader() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Container(
+          width: 68,
+          height: 68,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: <BoxShadow>[
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.06),
+                blurRadius: 18,
+              ),
+            ],
+          ),
+          child: const Icon(Icons.palette_outlined, size: 34),
+        ),
+        const SizedBox(height: 18),
+        const Text(
+          'Loading Coloring Book...',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: Colors.black87,
+          ),
+        ),
+        const SizedBox(height: 14),
+        const SizedBox(
+          width: 150,
+          child: LinearProgressIndicator(
+            minHeight: 4,
+            borderRadius: BorderRadius.all(Radius.circular(999)),
+          ),
+        ),
+      ],
     );
   }
 

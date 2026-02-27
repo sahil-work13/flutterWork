@@ -42,9 +42,46 @@ class PixelEngine {
   Uint8List get borderMask => _borderMask;
   Uint8List get originalRawRgba => _originalRawRgba;
 
-  void loadImage(Uint8List bytes) {
+  static Map<String, Object> decodeAndPrepare(Uint8List bytes) {
     final img.Image? decoded = img.decodeImage(bytes);
     if (decoded == null) {
+      return <String, Object>{
+        'width': 0,
+        'height': 0,
+        'raw': Uint8List(0),
+        'borderMask': Uint8List(0),
+      };
+    }
+
+    final int width = decoded.width;
+    final int height = decoded.height;
+    final Uint8List raw = Uint8List.fromList(decoded.getBytes());
+    final int len = width * height;
+    final Uint8List borderMask = Uint8List(len);
+
+    for (int i = 0, bi = 0; i < len; i++, bi += 4) {
+      if (raw[bi] < _borderThreshold &&
+          raw[bi + 1] < _borderThreshold &&
+          raw[bi + 2] < _borderThreshold) {
+        borderMask[i] = 1;
+      }
+    }
+
+    return <String, Object>{
+      'width': width,
+      'height': height,
+      'raw': raw,
+      'borderMask': borderMask,
+    };
+  }
+
+  void applyPreparedImage(Map<String, Object> prepared) {
+    final int width = prepared['width'] as int;
+    final int height = prepared['height'] as int;
+    final Uint8List raw = prepared['raw'] as Uint8List;
+    final Uint8List borderMask = prepared['borderMask'] as Uint8List;
+
+    if (width <= 0 || height <= 0 || raw.isEmpty || borderMask.isEmpty) {
       _isLoaded = false;
       _width = 0;
       _height = 0;
@@ -54,22 +91,16 @@ class PixelEngine {
       return;
     }
 
-    _width = decoded.width;
-    _height = decoded.height;
-    _originalRawRgba = Uint8List.fromList(decoded.getBytes());
+    _width = width;
+    _height = height;
+    _originalRawRgba = raw;
     _currentRawRgba = _originalRawRgba;
-
-    final int len = _width * _height;
-    _borderMask = Uint8List(len);
-
-    for (int i = 0, bi = 0; i < len; i++, bi += 4) {
-      if (_originalRawRgba[bi] < _borderThreshold &&
-          _originalRawRgba[bi + 1] < _borderThreshold &&
-          _originalRawRgba[bi + 2] < _borderThreshold) {
-        _borderMask[i] = 1;
-      }
-    }
+    _borderMask = borderMask;
     _isLoaded = true;
+  }
+
+  void loadImage(Uint8List bytes) {
+    applyPreparedImage(decodeAndPrepare(bytes));
   }
 
   void updateFromRawBytes(Uint8List rawRgba, int width, int height) {
@@ -198,7 +229,11 @@ class PixelEngine {
     if (!_isLoaded || _width == 0 || _height == 0 || _currentRawRgba.isEmpty) {
       return Uint8List(0);
     }
-    final img.Image image = img.Image.fromBytes(_width, _height, _currentRawRgba);
+    final img.Image image = img.Image.fromBytes(
+      _width,
+      _height,
+      _currentRawRgba,
+    );
     return Uint8List.fromList(img.encodePng(image));
   }
 }

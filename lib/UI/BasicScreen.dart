@@ -74,6 +74,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   int currentImageIndex = 0;
   bool _engineReady = false;
   bool _showStartupLoader = true;
+  bool _showImageTransitionLoader = false;
   int _imageLoadSeq = 0;
   bool _isImageLoading = false;
   int _queuedImageDelta = 0;
@@ -593,7 +594,10 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     if (mounted) {
       setState(() {
         _engineReady = false;
+        _showImageTransitionLoader = !_showStartupLoader && _uiImage != null;
       });
+    } else {
+      _showImageTransitionLoader = !_showStartupLoader && _uiImage != null;
     }
 
     try {
@@ -664,6 +668,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
       if (mounted && loadSeq == _imageLoadSeq) {
         setState(() {
           _engineReady = true;
+          _showImageTransitionLoader = false;
         });
       }
     } catch (e) {
@@ -672,11 +677,15 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         setState(() {
           _engineReady = false;
           _showStartupLoader = false;
+          _showImageTransitionLoader = false;
         });
       }
     } finally {
       if (loadSeq == _imageLoadSeq) {
         _isImageLoading = false;
+        if (!mounted) {
+          _showImageTransitionLoader = false;
+        }
       }
       _drainQueuedImageChange();
     }
@@ -1029,47 +1038,84 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                   ),
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(24),
-                    child: _uiImage == null
-                        ? const Center(child: CircularProgressIndicator())
-                        : LayoutBuilder(
-                            builder:
-                                (
-                                  BuildContext context,
-                                  BoxConstraints constraints,
-                                ) {
-                                  final Size newSize = Size(
-                                    constraints.maxWidth,
-                                    constraints.maxHeight,
-                                  );
-                                  if (_containerSize != newSize) {
-                                    _containerSize = newSize;
-                                    _updateFitCache();
-                                  }
-                                  return Listener(
-                                    onPointerDown: _onPointerDown,
-                                    onPointerMove: _onPointerMove,
-                                    onPointerUp: _onPointerUp,
-                                    onPointerCancel: _onPointerCancel,
-                                    child: InteractiveViewer(
-                                      transformationController:
-                                          _transformationController,
-                                      panEnabled: true,
-                                      minScale: 1.0,
-                                      maxScale: 10.0,
-                                      child: SizedBox(
-                                        width: constraints.maxWidth,
-                                        height: constraints.maxHeight,
-                                        child: Center(
-                                          child: RawImage(
-                                            image: _uiImage,
-                                            fit: BoxFit.contain,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: <Widget>[
+                        _uiImage == null
+                            ? const Center(child: CircularProgressIndicator())
+                            : LayoutBuilder(
+                                builder:
+                                    (
+                                      BuildContext context,
+                                      BoxConstraints constraints,
+                                    ) {
+                                      final Size newSize = Size(
+                                        constraints.maxWidth,
+                                        constraints.maxHeight,
+                                      );
+                                      if (_containerSize != newSize) {
+                                        _containerSize = newSize;
+                                        _updateFitCache();
+                                      }
+                                      return Listener(
+                                        onPointerDown: _onPointerDown,
+                                        onPointerMove: _onPointerMove,
+                                        onPointerUp: _onPointerUp,
+                                        onPointerCancel: _onPointerCancel,
+                                        child: InteractiveViewer(
+                                          transformationController:
+                                              _transformationController,
+                                          panEnabled: true,
+                                          minScale: 1.0,
+                                          maxScale: 10.0,
+                                          child: SizedBox(
+                                            width: constraints.maxWidth,
+                                            height: constraints.maxHeight,
+                                            child: Center(
+                                              child: RawImage(
+                                                image: _uiImage,
+                                                fit: BoxFit.contain,
+                                              ),
+                                            ),
                                           ),
                                         ),
+                                      );
+                                    },
+                              ),
+                        IgnorePointer(
+                          child: AnimatedOpacity(
+                            opacity: _showImageTransitionLoader ? 1.0 : 0.0,
+                            duration: const Duration(milliseconds: 180),
+                            curve: Curves.easeOutCubic,
+                            child: Container(
+                              color: Colors.white.withValues(alpha: 0.28),
+                              child: Center(
+                                child: Container(
+                                  width: 38,
+                                  height: 38,
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.circular(12),
+                                    boxShadow: <BoxShadow>[
+                                      BoxShadow(
+                                        color: Colors.black.withValues(
+                                          alpha: 0.12,
+                                        ),
+                                        blurRadius: 10,
                                       ),
-                                    ),
-                                  );
-                                },
+                                    ],
+                                  ),
+                                  child: const CircularProgressIndicator(
+                                    strokeWidth: 2.2,
+                                  ),
+                                ),
+                              ),
+                            ),
                           ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutterwork/features/paint/screens/basic_screen.dart';
 
-import 'UI/BasicScreen.dart';
+// import 'UI/BasicScreen.dart';
 
 void main() {
   runApp(const MyApp());

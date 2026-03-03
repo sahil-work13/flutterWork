@@ -17,6 +17,10 @@ class PaintTimelapseController {
     isRecording = true;
   }
 
+  void resume() {
+    isRecording = true;
+  }
+
   void stop() {
     isRecording = false;
   }
@@ -31,6 +35,18 @@ class PaintTimelapseController {
 
   void clear() {
     _frames.clear();
+  }
+
+  void replaceFrames(List<Uint8List> frames) {
+    _frames.clear();
+    if (frames.isEmpty) return;
+
+    final int start = frames.length > maxFrames ? frames.length - maxFrames : 0;
+    for (int i = start; i < frames.length; i++) {
+      final Uint8List raw = frames[i];
+      if (raw.isEmpty) continue;
+      _frames.add(Uint8List.fromList(raw));
+    }
   }
 
   List<Uint8List> getFrames() => List<Uint8List>.unmodifiable(_frames);

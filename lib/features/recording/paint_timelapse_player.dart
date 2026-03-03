@@ -3,6 +3,9 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
+
+import 'paint_timelapse_download.dart';
 
 class PaintTimelapsePlayer extends StatefulWidget {
   const PaintTimelapsePlayer({
@@ -23,6 +26,15 @@ class PaintTimelapsePlayer extends StatefulWidget {
 }
 
 class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
+  static const List<double> _speedOptions = <double>[
+    0.25,
+    0.5,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+  ];
+
   late final List<Uint8List> _frames;
 
   ui.Image? _currentImage;
@@ -30,6 +42,8 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
   int _frameIndex = 0;
   bool _isPlaying = false;
   bool _isDecoding = false;
+  bool _isExporting = false;
+  double _playbackSpeed = 2.0;
 
   @override
   void initState() {
@@ -51,7 +65,7 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
     if (_frames.length <= 1) return;
     _timer?.cancel();
     _isPlaying = true;
-    _timer = Timer.periodic(widget.frameInterval, (_) {
+    _timer = Timer.periodic(_effectiveFrameInterval, (_) {
       if (_isDecoding || !_hasValidInput()) return;
       final int next = (_frameIndex + 1) % _frames.length;
       unawaited(_showFrame(next));
@@ -75,6 +89,96 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
       return;
     }
     _startPlayback();
+  }
+
+  Duration get _effectiveFrameInterval {
+    final int baseMs = widget.frameInterval.inMilliseconds;
+    final int effectiveMs = (baseMs * (2.0 / _playbackSpeed)).round();
+    return Duration(milliseconds: effectiveMs < 1 ? 1 : effectiveMs);
+  }
+
+  void _setPlaybackSpeed(double speed) {
+    if (_playbackSpeed == speed) return;
+    setState(() {
+      _playbackSpeed = speed;
+    });
+    if (_isPlaying) {
+      _startPlayback();
+    }
+  }
+
+  Future<void> _downloadTimelapse() async {
+    if (_isExporting || !_hasValidInput()) return;
+
+    setState(() {
+      _isExporting = true;
+    });
+
+    try {
+      final Uint8List gifBytes = _encodeGifBytes();
+      if (gifBytes.isEmpty) {
+        _showSnackBar('Could not export timelapse');
+        return;
+      }
+
+      final String fileName =
+          'coloring_timelapse_${DateTime.now().millisecondsSinceEpoch}.gif';
+      final String? savedPath = await saveTimelapseBytes(gifBytes, fileName);
+      if (!mounted) return;
+
+      if (savedPath == null) {
+        _showSnackBar('Download is not available on this platform');
+      } else {
+        _showSnackBar('Saved: $savedPath');
+      }
+    } catch (_) {
+      if (!mounted) return;
+      _showSnackBar('Failed to download timelapse');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isExporting = false;
+        });
+      }
+    }
+  }
+
+  Uint8List _encodeGifBytes() {
+    final int expectedLength = widget.width * widget.height * 4;
+    final int frameDurationCs = (_effectiveFrameInterval.inMilliseconds / 10).round();
+    final img.GifEncoder encoder = img.GifEncoder(repeat: 0);
+
+    for (final Uint8List raw in _frames) {
+      if (raw.lengthInBytes != expectedLength) continue;
+      final img.Image frame = img.Image.fromBytes(
+        widget.width,
+        widget.height,
+        Uint8List.fromList(raw),
+      );
+      encoder.addFrame(frame, duration: frameDurationCs < 1 ? 1 : frameDurationCs);
+    }
+
+    final List<int>? bytes = encoder.finish();
+    if (bytes == null || bytes.isEmpty) return Uint8List(0);
+    return Uint8List.fromList(bytes);
+  }
+
+  void _showSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  String _formatSpeed(double speed) {
+    if (speed == speed.roundToDouble()) {
+      return speed.toStringAsFixed(0);
+    }
+    final String twoDecimals = speed.toStringAsFixed(2);
+    if (twoDecimals.endsWith('0')) {
+      return speed.toStringAsFixed(1);
+    }
+    return twoDecimals;
   }
 
   Future<void> _showFrame(int index) async {
@@ -138,6 +242,37 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
       appBar: AppBar(
         title: const Text('Timelapse Replay'),
         actions: <Widget>[
+          PopupMenuButton<double>(
+            tooltip: 'Playback speed',
+            initialValue: _playbackSpeed,
+            onSelected: _setPlaybackSpeed,
+            itemBuilder: (BuildContext context) {
+              return _speedOptions.map((double speed) {
+                return PopupMenuItem<double>(
+                  value: speed,
+                  child: Text(
+                    '${_formatSpeed(speed)}x',
+                  ),
+                );
+              }).toList();
+            },
+            icon: const Icon(Icons.speed),
+          ),
+          _isExporting
+              ? const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12),
+                  child: Center(
+                    child: SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                )
+              : IconButton(
+                  onPressed: _hasValidInput() ? _downloadTimelapse : null,
+                  icon: const Icon(Icons.download),
+                ),
           IconButton(
             onPressed: _frames.length > 1 ? _togglePlayback : null,
             icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),

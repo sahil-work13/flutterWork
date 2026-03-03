@@ -23,6 +23,7 @@ class _SessionSnapshot {
   final int rawHeight;
   final Uint8List? rawFillBytes;
   final List<Uint8List?> undoStack;
+  final List<Uint8List> timelapseFrames;
 
   const _SessionSnapshot({
     required this.imageIndex,
@@ -32,6 +33,7 @@ class _SessionSnapshot {
     required this.rawHeight,
     required this.rawFillBytes,
     required this.undoStack,
+    required this.timelapseFrames,
   });
 }
 
@@ -302,6 +304,10 @@ class BasicScreenController extends ChangeNotifier {
             await undoFile.delete();
           }
         }
+        final File timelapseFile = _imageTimelapseRawFile(_currentImageIndex);
+        if (await timelapseFile.exists()) {
+          await timelapseFile.delete();
+        }
       }
     } catch (e) {
       _log('REFRESH', 'ERROR: $e');
@@ -444,8 +450,12 @@ class BasicScreenController extends ChangeNotifier {
         transformationController.value = Matrix4.identity();
         _updateFitCache();
       }
-      _timelapse.start();
-      _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+      if (restoreSavedState && _timelapse.hasFrames) {
+        _timelapse.resume();
+      } else {
+        _timelapse.start();
+        _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+      }
 
       _engineReady = true;
       _showImageTransitionLoader = false;
@@ -539,6 +549,10 @@ class BasicScreenController extends ChangeNotifier {
 
   File _imageUndoRawFile(int imageIndex, int undoIndex) => File(
     '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_undo_$undoIndex.raw',
+  );
+
+  File _imageTimelapseRawFile(int imageIndex) => File(
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_timelapse.raw',
   );
 
   File _preparedRawFile(int imageIndex) => File(
@@ -685,6 +699,7 @@ class BasicScreenController extends ChangeNotifier {
       rawHeight: _rawHeight,
       rawFillBytes: _rawFillBytes,
       undoStack: List<Uint8List?>.from(_undoStack),
+      timelapseFrames: _timelapse.getFrames(),
     );
   }
 
@@ -776,6 +791,7 @@ class BasicScreenController extends ChangeNotifier {
         await _imageUndoRawFile(snapshot.imageIndex, i)
             .writeAsBytes(entry, flush: true);
       }
+      final int timelapseFrameCount = await _persistTimelapseFrames(snapshot);
 
       final DateTime now = DateTime.now();
       final Map<String, dynamic> imageMeta = <String, dynamic>{
@@ -786,6 +802,7 @@ class BasicScreenController extends ChangeNotifier {
         'rawWidth': snapshot.rawWidth,
         'rawHeight': snapshot.rawHeight,
         'undoKinds': undoKinds,
+        'timelapseFrameCount': timelapseFrameCount,
         'undoStackPointer': snapshot.undoStack.isEmpty
             ? -1
             : snapshot.undoStack.length - 1,
@@ -795,6 +812,31 @@ class BasicScreenController extends ChangeNotifier {
     } catch (e) {
       _log('AUTOSAVE_IMAGE', 'ERROR: $e');
     }
+  }
+
+  Future<int> _persistTimelapseFrames(_SessionSnapshot snapshot) async {
+    final int frameBytes = snapshot.rawWidth * snapshot.rawHeight * 4;
+    if (frameBytes <= 0) return 0;
+
+    final List<Uint8List> validFrames = snapshot.timelapseFrames
+        .where((Uint8List frame) => frame.lengthInBytes == frameBytes)
+        .toList(growable: false);
+    final File timelapseFile = _imageTimelapseRawFile(snapshot.imageIndex);
+
+    if (validFrames.isEmpty) {
+      if (await timelapseFile.exists()) {
+        await timelapseFile.delete();
+      }
+      return 0;
+    }
+
+    final IOSink sink = timelapseFile.openWrite();
+    for (final Uint8List frame in validFrames) {
+      sink.add(frame);
+    }
+    await sink.flush();
+    await sink.close();
+    return validFrames.length;
   }
 
   Future<void> _persistSessionMetaSnapshot(_SessionMetaSnapshot snapshot) async {
@@ -817,6 +859,7 @@ class BasicScreenController extends ChangeNotifier {
       _rawFillBytes = null;
       _fillCount = 0;
       _undoStack.clear();
+      _timelapse.clear();
       return null;
     }
 
@@ -862,6 +905,7 @@ class BasicScreenController extends ChangeNotifier {
         _undoStack
           ..clear()
           ..addAll(restoredUndo);
+        await _restoreTimelapseFromImageMeta(meta);
 
         if (hasRawFill && savedWidth == _rawWidth && savedHeight == _rawHeight) {
           final File imageRawFile = _imageRawFile(_currentImageIndex);
@@ -883,7 +927,43 @@ class BasicScreenController extends ChangeNotifier {
     _rawFillBytes = null;
     _fillCount = 0;
     _undoStack.clear();
+    _timelapse.clear();
     return null;
+  }
+
+  Future<void> _restoreTimelapseFromImageMeta(Map<dynamic, dynamic> meta) async {
+    final int frameCount =
+        (meta['timelapseFrameCount'] is int) ? meta['timelapseFrameCount'] as int : 0;
+    if (frameCount <= 0) {
+      _timelapse.clear();
+      return;
+    }
+
+    final File timelapseFile = _imageTimelapseRawFile(_currentImageIndex);
+    if (!await timelapseFile.exists()) {
+      _timelapse.clear();
+      return;
+    }
+
+    final int frameBytes = _rawWidth * _rawHeight * 4;
+    if (frameBytes <= 0) {
+      _timelapse.clear();
+      return;
+    }
+
+    final Uint8List raw = await timelapseFile.readAsBytes();
+    if (raw.lengthInBytes != frameCount * frameBytes) {
+      _timelapse.clear();
+      return;
+    }
+
+    final List<Uint8List> frames = <Uint8List>[];
+    for (int i = 0; i < frameCount; i++) {
+      final int start = i * frameBytes;
+      final int end = start + frameBytes;
+      frames.add(Uint8List.fromList(raw.sublist(start, end)));
+    }
+    _timelapse.replaceFrames(frames);
   }
 
   Future<ui.Image> _decodeToUiImage(Uint8List bytes) async {

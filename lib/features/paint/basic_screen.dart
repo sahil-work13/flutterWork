@@ -1,8 +1,7 @@
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
-
-import '../controllers/basic_screen_controller.dart';
+import 'package:flutterwork/features/paint/basic_screen_controller.dart';
 import '../recording/paint_timelapse_player.dart';
 
 class BasicScreen extends StatefulWidget {

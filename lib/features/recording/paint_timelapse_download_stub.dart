@@ -1,5 +1,13 @@
 import 'dart:typed_data';
 
-Future<String?> saveTimelapseBytes(Uint8List bytes, String fileName) async {
+typedef TimelapseExportProgress = void Function(double progress);
+
+Future<String?> exportTimelapseVideo({
+  required List<Uint8List> frames,
+  required int width,
+  required int height,
+  required Duration frameInterval,
+  TimelapseExportProgress? onProgress,
+}) async {
   return null;
 }

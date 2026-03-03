@@ -3,18 +3,16 @@
 import 'dart:html' as html;
 import 'dart:typed_data';
 
-Future<String?> saveTimelapseBytes(Uint8List bytes, String fileName) async {
-  if (bytes.isEmpty) return null;
+typedef TimelapseExportProgress = void Function(double progress);
 
-  final html.Blob blob = html.Blob(<dynamic>[bytes], 'image/gif');
-  final String url = html.Url.createObjectUrlFromBlob(blob);
-  final html.AnchorElement anchor = html.AnchorElement(href: url)
-    ..download = fileName
-    ..style.display = 'none';
-
-  html.document.body?.append(anchor);
-  anchor.click();
-  anchor.remove();
-  html.Url.revokeObjectUrl(url);
-  return fileName;
+Future<String?> exportTimelapseVideo({
+  required List<Uint8List> frames,
+  required int width,
+  required int height,
+  required Duration frameInterval,
+  TimelapseExportProgress? onProgress,
+}) async {
+  onProgress?.call(0.0);
+  html.window.alert('MP4 export is supported on Android and iOS in this app.');
+  return null;
 }

@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
 
 import 'paint_timelapse_download.dart';
 
@@ -43,6 +42,7 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
   bool _isPlaying = false;
   bool _isDecoding = false;
   bool _isExporting = false;
+  double _exportProgress = 0.0;
   double _playbackSpeed = 2.0;
 
   @override
@@ -112,55 +112,40 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
 
     setState(() {
       _isExporting = true;
+      _exportProgress = 0.0;
     });
 
     try {
-      final Uint8List gifBytes = _encodeGifBytes();
-      if (gifBytes.isEmpty) {
-        _showSnackBar('Could not export timelapse');
-        return;
-      }
-
-      final String fileName =
-          'coloring_timelapse_${DateTime.now().millisecondsSinceEpoch}.gif';
-      final String? savedPath = await saveTimelapseBytes(gifBytes, fileName);
+      final String? savedPath = await exportTimelapseVideo(
+        frames: _frames,
+        width: widget.width,
+        height: widget.height,
+        frameInterval: _effectiveFrameInterval,
+        onProgress: (double progress) {
+          if (!mounted) return;
+          setState(() {
+            _exportProgress = progress.clamp(0.0, 1.0);
+          });
+        },
+      );
       if (!mounted) return;
 
       if (savedPath == null) {
-        _showSnackBar('Download is not available on this platform');
+        _showSnackBar('MP4 export is not available on this device');
       } else {
-        _showSnackBar('Saved: $savedPath');
+        _showSnackBar('Saved video: $savedPath');
       }
     } catch (_) {
       if (!mounted) return;
-      _showSnackBar('Failed to download timelapse');
+      _showSnackBar('Failed to export timelapse video');
     } finally {
       if (mounted) {
         setState(() {
           _isExporting = false;
+          _exportProgress = 0.0;
         });
       }
     }
-  }
-
-  Uint8List _encodeGifBytes() {
-    final int expectedLength = widget.width * widget.height * 4;
-    final int frameDurationCs = (_effectiveFrameInterval.inMilliseconds / 10).round();
-    final img.GifEncoder encoder = img.GifEncoder(repeat: 0);
-
-    for (final Uint8List raw in _frames) {
-      if (raw.lengthInBytes != expectedLength) continue;
-      final img.Image frame = img.Image.fromBytes(
-        widget.width,
-        widget.height,
-        Uint8List.fromList(raw),
-      );
-      encoder.addFrame(frame, duration: frameDurationCs < 1 ? 1 : frameDurationCs);
-    }
-
-    final List<int>? bytes = encoder.finish();
-    if (bytes == null || bytes.isEmpty) return Uint8List(0);
-    return Uint8List.fromList(bytes);
   }
 
   void _showSnackBar(String message) {
@@ -179,6 +164,10 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
       return speed.toStringAsFixed(1);
     }
     return twoDecimals;
+  }
+
+  String _formatPercent(double value) {
+    return '${(value * 100).clamp(0, 100).toStringAsFixed(0)}%';
   }
 
   Future<void> _showFrame(int index) async {
@@ -250,46 +239,74 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
               return _speedOptions.map((double speed) {
                 return PopupMenuItem<double>(
                   value: speed,
-                  child: Text(
-                    '${_formatSpeed(speed)}x',
-                  ),
+                  child: Text('${_formatSpeed(speed)}x'),
                 );
               }).toList();
             },
-            icon: const Icon(Icons.speed),
-          ),
-          _isExporting
-              ? const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 12),
-                  child: Center(
-                    child: SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  '${_formatSpeed(_playbackSpeed)}x',
+                  style: const TextStyle(
+                    color: Colors.black87,
+                    fontWeight: FontWeight.w600,
                   ),
-                )
-              : IconButton(
-                  onPressed: _hasValidInput() ? _downloadTimelapse : null,
-                  icon: const Icon(Icons.download),
                 ),
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: _hasValidInput() && !_isExporting ? _downloadTimelapse : null,
+            icon: const Icon(Icons.download),
+          ),
           IconButton(
             onPressed: _frames.length > 1 ? _togglePlayback : null,
             icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
           ),
         ],
       ),
-      body: hasValidInput
-          ? Center(
-              child: AspectRatio(
-                aspectRatio: widget.width / widget.height,
-                child: Container(
-                  color: Colors.white,
-                  child: RawImage(image: _currentImage, fit: BoxFit.contain),
-                ),
+      body: Column(
+        children: <Widget>[
+          if (_isExporting)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      const Text(
+                        'Downloading video...',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const Spacer(),
+                      Text(
+                        _formatPercent(_exportProgress),
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  LinearProgressIndicator(value: _exportProgress),
+                ],
               ),
-            )
-          : const Center(child: Text('No timelapse frames available')),
+            ),
+          Expanded(
+            child: hasValidInput
+                ? Center(
+                    child: AspectRatio(
+                      aspectRatio: widget.width / widget.height,
+                      child: Container(
+                        color: Colors.white,
+                        child: RawImage(image: _currentImage, fit: BoxFit.contain),
+                      ),
+                    ),
+                  )
+                : const Center(child: Text('No timelapse frames available')),
+          ),
+        ],
+      ),
     );
   }
 }

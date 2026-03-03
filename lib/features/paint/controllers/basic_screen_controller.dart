@@ -9,6 +9,7 @@ import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../../engine/PixelEngine.dart';
+import '../recording/paint_timelapse_controller.dart';
 
 void _log(String tag, String msg) {
   debugPrint('[COLOR_APP][$tag] $msg');
@@ -52,6 +53,7 @@ class BasicScreenController extends ChangeNotifier {
   final String _metaBoxSuffix = '_metadata_box';
 
   final PixelEngine pixelEngine = PixelEngine();
+  final PaintTimelapseController _timelapse = PaintTimelapseController();
   final TransformationController transformationController =
       TransformationController();
 
@@ -133,6 +135,10 @@ class BasicScreenController extends ChangeNotifier {
   bool get canUndo => _undoStack.isNotEmpty && !_isProcessing && _engineReady;
   bool get canRefresh => !_isProcessing && _engineReady;
   bool get canPickColor => _engineReady;
+  bool get hasTimelapseFrames => _timelapse.hasFrames;
+  List<Uint8List> get timelapseFrames => _timelapse.getFrames();
+  int get rawWidth => _rawWidth;
+  int get rawHeight => _rawHeight;
 
   void init() {
     unawaited(_prepareStorageAndInit());
@@ -263,6 +269,7 @@ class BasicScreenController extends ChangeNotifier {
         pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
         restoredImage = await _rawRgbaToUiImage(snapshot, _rawWidth, _rawHeight);
       }
+      _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
 
       if (_disposed) {
         restoredImage.dispose();
@@ -352,6 +359,7 @@ class BasicScreenController extends ChangeNotifier {
 
       _rawFillBytes = rawResult;
       pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
+      _timelapse.recordFrame(_rawFillBytes!);
 
       final ui.Image newUiImage = await _rawRgbaToUiImage(
         rawResult,
@@ -436,6 +444,8 @@ class BasicScreenController extends ChangeNotifier {
         transformationController.value = Matrix4.identity();
         _updateFitCache();
       }
+      _timelapse.start();
+      _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
 
       _engineReady = true;
       _showImageTransitionLoader = false;
@@ -926,6 +936,7 @@ class BasicScreenController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _timelapse.stop();
     _autosaveTimer?.cancel();
     unawaited(_flushStorageOnDispose());
     _replaceUiImage(null);

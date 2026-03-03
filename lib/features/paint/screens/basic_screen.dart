@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import '../controllers/basic_screen_controller.dart';
+import '../recording/paint_timelapse_player.dart';
 
 class BasicScreen extends StatefulWidget {
   const BasicScreen({super.key});
@@ -66,6 +67,28 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                   )
                 : null,
             actions: <Widget>[
+              IconButton(
+                icon: Icon(
+                  Icons.play_circle_fill,
+                  color: _controller.hasTimelapseFrames
+                      ? Colors.black
+                      : Colors.grey.shade300,
+                ),
+                onPressed: _controller.hasTimelapseFrames
+                    ? () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute<void>(
+                            builder: (_) => PaintTimelapsePlayer(
+                              frames: _controller.timelapseFrames,
+                              width: _controller.rawWidth,
+                              height: _controller.rawHeight,
+                            ),
+                          ),
+                        );
+                      }
+                    : null,
+              ),
               IconButton(
                 icon: Icon(
                   Icons.undo,

@@ -4,7 +4,7 @@ class DailyChallengeCard extends StatelessWidget {
   const DailyChallengeCard({
     super.key,
     required this.title,
-    required this.imagePath,
+    this.imagePath = 'assets/images/mandala.png',
     required this.onStartTap,
   });
 
@@ -36,26 +36,18 @@ class DailyChallengeCard extends StatelessWidget {
           borderRadius: BorderRadius.circular(24),
           child: Stack(
             children: <Widget>[
-              const Positioned(
+              Positioned(
                 right: 8,
                 top: 8,
-                child: Text(
-                  '🌊',
-                  style: TextStyle(
-                    fontSize: 74,
-                    color: Color.fromRGBO(255, 255, 255, 0.30),
-                  ),
-                ),
-              ),
-              Positioned(
-                right: 20,
-                bottom: 14,
                 child: SizedBox(
-                  width: 72,
-                  height: 72,
+                  width: 74,
+                  height: 74,
                   child: ClipRRect(
-                    borderRadius: BorderRadius.circular(14),
-                    child: Image.asset(imagePath, fit: BoxFit.cover),
+                    borderRadius: BorderRadius.circular(16),
+                    child: Opacity(
+                      opacity: 0.30,
+                      child: Image.asset(imagePath, fit: BoxFit.cover),
+                    ),
                   ),
                 ),
               ),

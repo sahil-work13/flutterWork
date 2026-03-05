@@ -1,9 +1,16 @@
 import 'package:flutter/material.dart';
 
 class CategoriesSection extends StatelessWidget {
-  const CategoriesSection({super.key, required this.categories});
+  const CategoriesSection({
+    super.key,
+    required this.categories,
+    this.onTapCategory,
+    this.labelBuilder,
+  });
 
   final List<String> categories;
+  final ValueChanged<String>? onTapCategory;
+  final String Function(String category)? labelBuilder;
 
   @override
   Widget build(BuildContext context) {
@@ -28,25 +35,36 @@ class CategoriesSection extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 20),
             scrollDirection: Axis.horizontal,
             itemBuilder: (BuildContext context, int index) {
-              return Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 8,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white,
+              final String category = categories[index];
+              final String label = labelBuilder?.call(category) ?? category;
+              return Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: onTapCategory == null
+                      ? null
+                      : () => onTapCategory!(category),
                   borderRadius: BorderRadius.circular(100),
-                  border: Border.all(
-                    color: const Color(0xFFE9E8F4),
-                    width: 1.5,
-                  ),
-                ),
-                child: Text(
-                  categories[index],
-                  style: const TextStyle(
-                    color: Color(0xFF7C7C9A),
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(100),
+                      border: Border.all(
+                        color: const Color(0xFFE9E8F4),
+                        width: 1.5,
+                      ),
+                    ),
+                    child: Text(
+                      label,
+                      style: const TextStyle(
+                        color: Color(0xFF7C7C9A),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                   ),
                 ),
               );

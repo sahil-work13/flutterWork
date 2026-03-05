@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutterwork/core/utils/greeting_utils.dart';
 import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
 import 'package:flutterwork/core/widgets/image_card.dart';
+import 'package:flutterwork/features/explore/services/explore_catalog_service.dart';
+import 'package:flutterwork/features/explore/screens/explore_screen.dart';
 import 'package:flutterwork/features/home/widgets/categories_section.dart';
 import 'package:flutterwork/features/home/widgets/daily_challenge_card.dart';
 import 'package:flutterwork/features/home/widgets/featured_section.dart';
@@ -41,15 +43,7 @@ class _HomeScreenState extends State<HomeScreen> {
     <Color>[Color(0xFFEAFDEB), Color(0xFFF4FFF4)],
     <Color>[Color(0xFFFFF3E1), Color(0xFFFFFAF1)],
   ];
-  static const List<String> _categories = <String>[
-    'Mandalas 🌸',
-    'Animals 🦊',
-    'Nature 🌿',
-    'Fantasy 🏰',
-    'Abstract ⬡',
-    'Cities 🌆',
-    'Food 🍜',
-  ];
+  List<String> _categories = const <String>[];
 
   final int _streakDays = 7;
   final int _notifications = 2;
@@ -75,6 +69,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _greetingTicker = Timer.periodic(const Duration(minutes: 1), (_) {
       if (mounted) setState(() {});
     });
+    unawaited(_loadCategories());
   }
 
   @override
@@ -85,6 +80,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final ImageCardItem dailyChallengeItem = _items.firstWhere(
+      (ImageCardItem item) => !item.imagePath.toLowerCase().contains('doremon'),
+      orElse: () => _items.first,
+    );
+
     return Scaffold(
       backgroundColor: const Color(0xFFF8F7FF),
       body: Stack(
@@ -105,9 +105,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   const SizedBox(height: 12),
                   DailyChallengeCard(
-                    title: _items.first.title,
-                    imagePath: _items.first.imagePath,
-                    onStartTap: () => _openPainter(_items.first.imagePath),
+                    title: dailyChallengeItem.title,
+                    imagePath: dailyChallengeItem.imagePath,
+                    onStartTap: () =>
+                        _openPainter(dailyChallengeItem.imagePath),
                   ),
                   const SizedBox(height: 16),
                   _buildLevelCard(),
@@ -118,7 +119,11 @@ class _HomeScreenState extends State<HomeScreen> {
                         _openPainter(item.imagePath),
                   ),
                   const SizedBox(height: 20),
-                  CategoriesSection(categories: _categories),
+                  CategoriesSection(
+                    categories: _categories,
+                    labelBuilder: _categoryLabelWithEmoji,
+                    onTapCategory: _openExploreCategory,
+                  ),
                   const SizedBox(height: 20),
                   TrendingSection(
                     items: _items,
@@ -130,9 +135,9 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ),
-          const Align(
+          Align(
             alignment: Alignment.bottomCenter,
-            child: AppBottomNavBar(),
+            child: AppBottomNavBar(activeIndex: 0, onTap: _onBottomNavTap),
           ),
         ],
       ),
@@ -245,6 +250,57 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Notifications are coming soon.')),
     );
+  }
+
+  void _onBottomNavTap(int index) {
+    if (index == 0) return;
+    if (index == 1) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute<void>(builder: (_) => const ExploreScreen()),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('This tab will be available soon.')),
+    );
+  }
+
+  Future<void> _loadCategories() async {
+    try {
+      final List<String> categories =
+          await ExploreCatalogService.loadCategories();
+      if (!mounted) return;
+      setState(() {
+        _categories = categories;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _categories = const <String>['Characters', 'Mandalas', 'Practice'];
+      });
+    }
+  }
+
+  void _openExploreCategory(String category) {
+    Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => ExploreScreen(initialCategory: category),
+      ),
+    );
+  }
+
+  String _categoryLabelWithEmoji(String category) {
+    const Map<String, String> emojiByCategory = <String, String>{
+      'Characters': '😀',
+      'Mandalas': '🌸',
+      'Practice': '🧪',
+      'Onboarding': '✨',
+      'Others': '🎨',
+    };
+    final String emoji = emojiByCategory[category] ?? '🎯';
+    return '$category $emoji';
   }
 
   String _titleFromAsset(String assetPath) {

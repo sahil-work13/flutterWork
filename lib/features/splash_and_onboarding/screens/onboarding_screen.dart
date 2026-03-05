@@ -144,7 +144,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                         child: Text(
                           _onboardingSlide < _slides.length - 1
                               ? 'Continue'
-                              : 'Get Started ðŸŽ¨',
+                              : 'Get Started 🎨',
                         ),
                       ),
                     ),

@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:flutterwork/core/data/canvas_image_assets.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -14,6 +15,8 @@ import '../recording/paint_timelapse_controller.dart';
 void _log(String tag, String msg) {
   debugPrint('[COLOR_APP][$tag] $msg');
 }
+
+enum PaintToolMode { fill, brush, eraser }
 
 class _SessionSnapshot {
   final int imageIndex;
@@ -48,7 +51,7 @@ class _SessionMetaSnapshot {
 }
 
 class BasicScreenController extends ChangeNotifier {
-  final String _sessionNamespace = 'coloring_book_session_v1';
+  final String _sessionNamespace = 'coloring_book_session_v2';
   final String _sessionMetaKey = 'session_meta';
   final String _imageMetaKeyPrefix = 'image_meta_';
   final String _preparedMetaKeyPrefix = 'prepared_meta_';
@@ -67,11 +70,14 @@ class BasicScreenController extends ChangeNotifier {
   int _rawHeight = 0;
 
   final List<Uint8List?> _undoStack = <Uint8List?>[];
+  final List<Uint8List?> _redoStack = <Uint8List?>[];
   final int _maxUndoSteps = 20;
 
   int _fillCount = 0;
   Color _selectedColor = const Color(0xFFFFC107);
+  PaintToolMode _activeTool = PaintToolMode.fill;
   bool _isProcessing = false;
+  int _progressPercent = 0;
   int _currentImageIndex = 0;
   bool _engineReady = false;
   bool _showStartupLoader = true;
@@ -120,13 +126,10 @@ class BasicScreenController extends ChangeNotifier {
     const Color(0xFF9E9E9E),
     const Color(0xFFFFFFFF),
   ];
+  final List<Color> _recentColors = <Color>[];
+  final Map<int, int> _colorUseCount = <int, int>{};
 
-  final List<String> _testImages = <String>[
-    'assets/images/doremon.png',
-    'assets/images/shinchan.png',
-    'assets/images/mandala.png',
-    'assets/images/smilie.png',
-  ];
+  final List<String> _testImages = List<String>.from(CanvasImageAssets.all);
 
   BasicScreenController({String? initialImagePath})
     : _hasExplicitInitialImage = initialImagePath != null {
@@ -136,22 +139,29 @@ class BasicScreenController extends ChangeNotifier {
         _currentImageIndex = selectedImageIndex;
       }
     }
+    _markColorRecent(_selectedColor);
   }
 
   ui.Image? get uiImage => _uiImage;
   Color get selectedColor => _selectedColor;
+  PaintToolMode get activeTool => _activeTool;
   bool get isProcessing => _isProcessing;
   bool get engineReady => _engineReady;
   bool get showStartupLoader => _showStartupLoader;
   bool get showImageTransitionLoader => _showImageTransitionLoader;
   List<Color> get colorHistory => _colorHistory;
   bool get canUndo => _undoStack.isNotEmpty && !_isProcessing && _engineReady;
+  bool get canRedo => _redoStack.isNotEmpty && !_isProcessing && _engineReady;
   bool get canRefresh => !_isProcessing && _engineReady;
   bool get canPickColor => _engineReady;
   bool get hasTimelapseFrames => _timelapse.hasFrames;
   List<Uint8List> get timelapseFrames => _timelapse.getFrames();
   int get rawWidth => _rawWidth;
   int get rawHeight => _rawHeight;
+  int get fillCount => _fillCount;
+  int get progressPercent => _progressPercent;
+  int get remainingPercent => 100 - _progressPercent;
+  List<Color> get recentOrMostUsedColors => _buildSuggestedColors();
 
   void init() {
     unawaited(_prepareStorageAndInit());
@@ -174,6 +184,13 @@ class BasicScreenController extends ChangeNotifier {
 
   void selectColor(Color color) {
     _selectedColor = color;
+    _markColorRecent(color);
+    _notify();
+  }
+
+  void setActiveTool(PaintToolMode tool) {
+    if (_activeTool == tool) return;
+    _activeTool = tool;
     _notify();
   }
 
@@ -269,6 +286,7 @@ class BasicScreenController extends ChangeNotifier {
     _notify();
     try {
       final Uint8List? snapshot = _undoStack.removeLast();
+      _redoStack.add(_rawFillBytes);
       if (_fillCount > 0) _fillCount--;
 
       ui.Image restoredImage;
@@ -291,6 +309,7 @@ class BasicScreenController extends ChangeNotifier {
         );
       }
       _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+      _recomputeProgressPercent();
 
       if (_disposed) {
         restoredImage.dispose();
@@ -303,6 +322,54 @@ class BasicScreenController extends ChangeNotifier {
       _requestAutosave();
     } catch (e) {
       _log('UNDO', 'ERROR: $e');
+      _isProcessing = false;
+      _notify();
+    }
+  }
+
+  Future<void> redo() async {
+    if (_redoStack.isEmpty || _isProcessing || !_engineReady) return;
+
+    _isProcessing = true;
+    _notify();
+    try {
+      final Uint8List? snapshot = _redoStack.removeLast();
+      _pushUndoSnapshot(_rawFillBytes);
+      _fillCount++;
+
+      ui.Image restoredImage;
+      if (snapshot == null) {
+        final Uint8List originalRaw = pixelEngine.originalRawRgba;
+        _rawFillBytes = null;
+        pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
+        restoredImage = await _rawRgbaToUiImage(
+          originalRaw,
+          _rawWidth,
+          _rawHeight,
+        );
+      } else {
+        _rawFillBytes = snapshot;
+        pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
+        restoredImage = await _rawRgbaToUiImage(
+          snapshot,
+          _rawWidth,
+          _rawHeight,
+        );
+      }
+      _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+      _recomputeProgressPercent();
+
+      if (_disposed) {
+        restoredImage.dispose();
+        return;
+      }
+
+      _replaceUiImage(restoredImage);
+      _isProcessing = false;
+      _notify();
+      _requestAutosave();
+    } catch (e) {
+      _log('REDO', 'ERROR: $e');
       _isProcessing = false;
       _notify();
     }
@@ -356,23 +423,9 @@ class BasicScreenController extends ChangeNotifier {
 
     try {
       _fillCount++;
-      final int thisFill = _fillCount;
-
       final Uint8List? snapshot = _rawFillBytes;
-
-      if (_undoStack.length >= _maxUndoSteps) {
-        if (_undoStack[0] == null) {
-          _log(
-            'FILL#$thisFill',
-            'Stack full. Protecting original. Removing index 1.',
-          );
-          _undoStack.removeAt(1);
-        } else {
-          _log('FILL#$thisFill', 'Stack full. Removing oldest.');
-          _undoStack.removeAt(0);
-        }
-      }
-      _undoStack.add(snapshot);
+      _pushUndoSnapshot(snapshot);
+      _redoStack.clear();
 
       final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
 
@@ -384,15 +437,35 @@ class BasicScreenController extends ChangeNotifier {
           y: pixelY,
           width: _rawWidth,
           height: _rawHeight,
-          fillR: _to8Bit(_selectedColor.r),
-          fillG: _to8Bit(_selectedColor.g),
-          fillB: _to8Bit(_selectedColor.b),
+          fillR: _to8Bit(
+            (_activeTool == PaintToolMode.eraser
+                    ? Colors.white
+                    : _selectedColor)
+                .r,
+          ),
+          fillG: _to8Bit(
+            (_activeTool == PaintToolMode.eraser
+                    ? Colors.white
+                    : _selectedColor)
+                .g,
+          ),
+          fillB: _to8Bit(
+            (_activeTool == PaintToolMode.eraser
+                    ? Colors.white
+                    : _selectedColor)
+                .b,
+          ),
         ),
       );
 
       _rawFillBytes = rawResult;
       pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
       _timelapse.recordFrame(_rawFillBytes!);
+      _recomputeProgressPercent();
+      final bool didChangePixels = !identical(rawResult, baseRaw);
+      if (didChangePixels && _activeTool != PaintToolMode.eraser) {
+        _markColorRecent(_selectedColor, incrementUsage: true);
+      }
 
       final ui.Image newUiImage = await _rawRgbaToUiImage(
         rawResult,
@@ -461,6 +534,7 @@ class BasicScreenController extends ChangeNotifier {
       _rawWidth = pixelEngine.imageWidth;
       _rawHeight = pixelEngine.imageHeight;
       _undoStack.clear();
+      _redoStack.clear();
 
       final ui.Image? loaded = restoreSavedState
           ? await _buildCurrentImageFromSavedState()
@@ -474,6 +548,7 @@ class BasicScreenController extends ChangeNotifier {
         _rawFillBytes = null;
         _fillCount = 0;
         _undoStack.clear();
+        _redoStack.clear();
       }
 
       if (loaded != null) {
@@ -487,6 +562,7 @@ class BasicScreenController extends ChangeNotifier {
         _timelapse.start();
         _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
       }
+      _recomputeProgressPercent();
 
       _engineReady = true;
       _showImageTransitionLoader = false;
@@ -904,6 +980,7 @@ class BasicScreenController extends ChangeNotifier {
       _rawFillBytes = null;
       _fillCount = 0;
       _undoStack.clear();
+      _redoStack.clear();
       _timelapse.clear();
       return null;
     }
@@ -954,6 +1031,7 @@ class BasicScreenController extends ChangeNotifier {
         _undoStack
           ..clear()
           ..addAll(restoredUndo);
+        _redoStack.clear();
         await _restoreTimelapseFromImageMeta(meta);
 
         if (hasRawFill &&
@@ -982,8 +1060,121 @@ class BasicScreenController extends ChangeNotifier {
     _rawFillBytes = null;
     _fillCount = 0;
     _undoStack.clear();
+    _redoStack.clear();
     _timelapse.clear();
+    _recomputeProgressPercent();
     return null;
+  }
+
+  Future<File?> exportCurrentImagePng() async {
+    final ui.Image? image = _uiImage;
+    if (image == null) return null;
+
+    final ByteData? pngData = await image.toByteData(
+      format: ui.ImageByteFormat.png,
+    );
+    if (pngData == null) return null;
+
+    final Directory tempDir = await getTemporaryDirectory();
+    final File output = File(
+      '${tempDir.path}${Platform.pathSeparator}color_fill_${DateTime.now().millisecondsSinceEpoch}.png',
+    );
+    await output.writeAsBytes(pngData.buffer.asUint8List(), flush: true);
+    return output;
+  }
+
+  void _pushUndoSnapshot(Uint8List? snapshot) {
+    if (_undoStack.length >= _maxUndoSteps) {
+      if (_undoStack.isNotEmpty && _undoStack.first == null) {
+        if (_undoStack.length > 1) {
+          _undoStack.removeAt(1);
+        } else {
+          _undoStack.removeAt(0);
+        }
+      } else {
+        _undoStack.removeAt(0);
+      }
+    }
+    _undoStack.add(snapshot);
+  }
+
+  void _recomputeProgressPercent() {
+    final int pixelCount = _rawWidth * _rawHeight;
+    if (pixelCount <= 0) {
+      _progressPercent = 0;
+      return;
+    }
+
+    final Uint8List originalRaw = pixelEngine.originalRawRgba;
+    final Uint8List currentRaw = _rawFillBytes ?? originalRaw;
+    final Uint8List borderMask = pixelEngine.borderMask;
+
+    if (originalRaw.lengthInBytes != pixelCount * 4 ||
+        currentRaw.lengthInBytes != pixelCount * 4 ||
+        borderMask.lengthInBytes != pixelCount) {
+      _progressPercent = 0;
+      return;
+    }
+
+    int fillablePixels = 0;
+    int paintedPixels = 0;
+    for (int i = 0, bi = 0; i < pixelCount; i++, bi += 4) {
+      if (borderMask[i] == 1) continue;
+      fillablePixels++;
+      final bool changed =
+          currentRaw[bi] != originalRaw[bi] ||
+          currentRaw[bi + 1] != originalRaw[bi + 1] ||
+          currentRaw[bi + 2] != originalRaw[bi + 2];
+      if (changed) paintedPixels++;
+    }
+
+    if (fillablePixels == 0) {
+      _progressPercent = 0;
+      return;
+    }
+    _progressPercent = ((paintedPixels * 100) / fillablePixels).round().clamp(
+      0,
+      100,
+    );
+  }
+
+  void _markColorRecent(Color color, {bool incrementUsage = false}) {
+    _recentColors.remove(color);
+    _recentColors.insert(0, color);
+    if (_recentColors.length > 10) {
+      _recentColors.removeRange(10, _recentColors.length);
+    }
+    if (incrementUsage) {
+      final int colorKey = color.toARGB32();
+      _colorUseCount[colorKey] = (_colorUseCount[colorKey] ?? 0) + 1;
+    }
+  }
+
+  List<Color> _buildSuggestedColors() {
+    final List<Color> out = <Color>[];
+    final Set<int> seen = <int>{};
+    void addColor(Color color) {
+      final int key = color.toARGB32();
+      if (seen.add(key)) {
+        out.add(color);
+      }
+    }
+
+    for (final Color color in _recentColors) {
+      addColor(color);
+    }
+
+    final List<MapEntry<int, int>> mostUsed = _colorUseCount.entries.toList()
+      ..sort((MapEntry<int, int> a, MapEntry<int, int> b) => b.value - a.value);
+    for (final MapEntry<int, int> entry in mostUsed) {
+      addColor(Color(entry.key));
+    }
+
+    for (final Color color in _colorHistory) {
+      addColor(color);
+    }
+
+    return out.take(10).toList(growable: false);
   }
 
   Future<void> _restoreTimelapseFromImageMeta(

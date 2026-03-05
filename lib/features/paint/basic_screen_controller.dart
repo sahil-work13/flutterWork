@@ -58,6 +58,7 @@ class BasicScreenController extends ChangeNotifier {
   final PaintTimelapseController _timelapse = PaintTimelapseController();
   final TransformationController transformationController =
       TransformationController();
+  final bool _hasExplicitInitialImage;
 
   ui.Image? _uiImage;
   Uint8List? _rawFillBytes;
@@ -126,6 +127,16 @@ class BasicScreenController extends ChangeNotifier {
     'assets/images/mandala.png',
     'assets/images/smilie.png',
   ];
+
+  BasicScreenController({String? initialImagePath})
+    : _hasExplicitInitialImage = initialImagePath != null {
+    if (initialImagePath != null) {
+      final int selectedImageIndex = _testImages.indexOf(initialImagePath);
+      if (selectedImageIndex >= 0) {
+        _currentImageIndex = selectedImageIndex;
+      }
+    }
+  }
 
   ui.Image? get uiImage => _uiImage;
   Color get selectedColor => _selectedColor;
@@ -265,11 +276,19 @@ class BasicScreenController extends ChangeNotifier {
         final Uint8List originalRaw = pixelEngine.originalRawRgba;
         _rawFillBytes = null;
         pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
-        restoredImage = await _rawRgbaToUiImage(originalRaw, _rawWidth, _rawHeight);
+        restoredImage = await _rawRgbaToUiImage(
+          originalRaw,
+          _rawWidth,
+          _rawHeight,
+        );
       } else {
         _rawFillBytes = snapshot;
         pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
-        restoredImage = await _rawRgbaToUiImage(snapshot, _rawWidth, _rawHeight);
+        restoredImage = await _rawRgbaToUiImage(
+          snapshot,
+          _rawWidth,
+          _rawHeight,
+        );
       }
       _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
 
@@ -320,10 +339,15 @@ class BasicScreenController extends ChangeNotifier {
     if (_uiImage == null || _isProcessing || !_engineReady) return;
 
     final Offset scene = transformationController.toScene(localOffset);
-    final int pixelX = ((scene.dx - _cachedFitOffsetX) / _cachedScaleFit).floor();
-    final int pixelY = ((scene.dy - _cachedFitOffsetY) / _cachedScaleFit).floor();
+    final int pixelX = ((scene.dx - _cachedFitOffsetX) / _cachedScaleFit)
+        .floor();
+    final int pixelY = ((scene.dy - _cachedFitOffsetY) / _cachedScaleFit)
+        .floor();
 
-    if (pixelX < 0 || pixelX >= _rawWidth || pixelY < 0 || pixelY >= _rawHeight) {
+    if (pixelX < 0 ||
+        pixelX >= _rawWidth ||
+        pixelY < 0 ||
+        pixelY >= _rawHeight) {
       return;
     }
 
@@ -338,7 +362,10 @@ class BasicScreenController extends ChangeNotifier {
 
       if (_undoStack.length >= _maxUndoSteps) {
         if (_undoStack[0] == null) {
-          _log('FILL#$thisFill', 'Stack full. Protecting original. Removing index 1.');
+          _log(
+            'FILL#$thisFill',
+            'Stack full. Protecting original. Removing index 1.',
+          );
           _undoStack.removeAt(1);
         } else {
           _log('FILL#$thisFill', 'Stack full. Removing oldest.');
@@ -419,8 +446,11 @@ class BasicScreenController extends ChangeNotifier {
       await Future<void>.delayed(Duration.zero);
       if (_disposed || loadSeq != _imageLoadSeq) return;
 
-      final Map<String, Object> prepared =
-          await _loadOrPrepareImageData(imageIndexAtLoad, assetPathAtLoad, bytes);
+      final Map<String, Object> prepared = await _loadOrPrepareImageData(
+        imageIndexAtLoad,
+        assetPathAtLoad,
+        bytes,
+      );
       if (_disposed || loadSeq != _imageLoadSeq) return;
 
       pixelEngine.applyPreparedImage(prepared);
@@ -432,8 +462,9 @@ class BasicScreenController extends ChangeNotifier {
       _rawHeight = pixelEngine.imageHeight;
       _undoStack.clear();
 
-      final ui.Image? loaded =
-          restoreSavedState ? await _buildCurrentImageFromSavedState() : null;
+      final ui.Image? loaded = restoreSavedState
+          ? await _buildCurrentImageFromSavedState()
+          : null;
       if (_disposed || loadSeq != _imageLoadSeq) {
         loaded?.dispose();
         return;
@@ -487,7 +518,8 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   bool _isSwipeNavigationAllowed() {
-    final double currentScale = transformationController.value.getMaxScaleOnAxis();
+    final double currentScale = transformationController.value
+        .getMaxScaleOnAxis();
     return currentScale <= 1.05;
   }
 
@@ -523,8 +555,9 @@ class BasicScreenController extends ChangeNotifier {
       _sessionDirectory = sessionDir;
 
       Hive.init(sessionDir.path);
-      _sessionMetaBox =
-          await Hive.openBox<dynamic>('$_sessionNamespace$_metaBoxSuffix');
+      _sessionMetaBox = await Hive.openBox<dynamic>(
+        '$_sessionNamespace$_metaBoxSuffix',
+      );
       _storageReady = true;
     } catch (e) {
       _log('STORAGE_INIT', 'ERROR: $e');
@@ -570,7 +603,9 @@ class BasicScreenController extends ChangeNotifier {
   ) async {
     try {
       if (!_storageReady || _sessionMetaBox == null) return null;
-      final dynamic rawMeta = _sessionMetaBox!.get(_preparedMetaKey(imageIndex));
+      final dynamic rawMeta = _sessionMetaBox!.get(
+        _preparedMetaKey(imageIndex),
+      );
       if (rawMeta is! Map) return null;
       final Map<dynamic, dynamic> meta = rawMeta;
       if (meta['version'] != 1) return null;
@@ -628,15 +663,16 @@ class BasicScreenController extends ChangeNotifier {
 
       await _preparedRawFile(imageIndex).writeAsBytes(raw, flush: true);
       await _preparedMaskFile(imageIndex).writeAsBytes(borderMask, flush: true);
-      await _sessionMetaBox!.put(_preparedMetaKey(imageIndex), <String, dynamic>{
-        'version': 1,
-        'imageId': imageIndex,
-        'assetPath': assetPath,
-        'assetByteLength': assetByteLength,
-        'width': width,
-        'height': height,
-        'lastModified': DateTime.now().toIso8601String(),
-      });
+      await _sessionMetaBox!
+          .put(_preparedMetaKey(imageIndex), <String, dynamic>{
+            'version': 1,
+            'imageId': imageIndex,
+            'assetPath': assetPath,
+            'assetByteLength': assetByteLength,
+            'width': width,
+            'height': height,
+            'lastModified': DateTime.now().toIso8601String(),
+          });
     } catch (e) {
       _log('PREPARED_CACHE_WRITE', 'ERROR: $e');
     }
@@ -674,11 +710,15 @@ class BasicScreenController extends ChangeNotifier {
       if (rawMeta is! Map) return false;
       final Map<dynamic, dynamic> meta = rawMeta;
 
-      final int restoredIndex =
-          (meta['currentImageIndex'] is int) ? meta['currentImageIndex'] as int : 0;
-      if (restoredIndex < 0 || restoredIndex >= _testImages.length) return false;
-
-      _currentImageIndex = restoredIndex;
+      final int restoredIndex = (meta['currentImageIndex'] is int)
+          ? meta['currentImageIndex'] as int
+          : 0;
+      if (!_hasExplicitInitialImage) {
+        if (restoredIndex < 0 || restoredIndex >= _testImages.length) {
+          return false;
+        }
+        _currentImageIndex = restoredIndex;
+      }
 
       if (meta['selectedColor'] is int) {
         _selectedColor = Color(meta['selectedColor'] as int);
@@ -740,8 +780,9 @@ class BasicScreenController extends ChangeNotifier {
       while (true) {
         while (_pendingImageSnapshots.isNotEmpty) {
           final int imageIndex = _pendingImageSnapshots.keys.first;
-          final _SessionSnapshot snapshot =
-              _pendingImageSnapshots.remove(imageIndex)!;
+          final _SessionSnapshot snapshot = _pendingImageSnapshots.remove(
+            imageIndex,
+          )!;
           await _persistImageSnapshot(snapshot);
         }
 
@@ -788,8 +829,10 @@ class BasicScreenController extends ChangeNotifier {
           continue;
         }
         undoKinds.add(1);
-        await _imageUndoRawFile(snapshot.imageIndex, i)
-            .writeAsBytes(entry, flush: true);
+        await _imageUndoRawFile(
+          snapshot.imageIndex,
+          i,
+        ).writeAsBytes(entry, flush: true);
       }
       final int timelapseFrameCount = await _persistTimelapseFrames(snapshot);
 
@@ -839,7 +882,9 @@ class BasicScreenController extends ChangeNotifier {
     return validFrames.length;
   }
 
-  Future<void> _persistSessionMetaSnapshot(_SessionMetaSnapshot snapshot) async {
+  Future<void> _persistSessionMetaSnapshot(
+    _SessionMetaSnapshot snapshot,
+  ) async {
     try {
       if (!_storageReady || _sessionMetaBox == null) return;
       final Map<String, dynamic> sessionMeta = <String, dynamic>{
@@ -863,21 +908,25 @@ class BasicScreenController extends ChangeNotifier {
       return null;
     }
 
-    final dynamic rawMeta = _sessionMetaBox!.get(_imageMetaKey(_currentImageIndex));
+    final dynamic rawMeta = _sessionMetaBox!.get(
+      _imageMetaKey(_currentImageIndex),
+    );
     if (rawMeta is Map) {
       try {
         final Map<dynamic, dynamic> meta = rawMeta;
 
         _fillCount = (meta['fillCount'] is int) ? meta['fillCount'] as int : 0;
         final bool hasRawFill = meta['hasRawFill'] == true;
-        final int savedWidth =
-            (meta['rawWidth'] is int) ? meta['rawWidth'] as int : _rawWidth;
-        final int savedHeight =
-            (meta['rawHeight'] is int) ? meta['rawHeight'] as int : _rawHeight;
+        final int savedWidth = (meta['rawWidth'] is int)
+            ? meta['rawWidth'] as int
+            : _rawWidth;
+        final int savedHeight = (meta['rawHeight'] is int)
+            ? meta['rawHeight'] as int
+            : _rawHeight;
         final List<int> undoKinds = (meta['undoKinds'] is List)
             ? (meta['undoKinds'] as List)
-                .map((dynamic e) => (e is int) ? e : -1)
-                .toList()
+                  .map((dynamic e) => (e is int) ? e : -1)
+                  .toList()
             : <int>[];
         final int undoStackPointer = (meta['undoStackPointer'] is int)
             ? meta['undoStackPointer'] as int
@@ -907,14 +956,20 @@ class BasicScreenController extends ChangeNotifier {
           ..addAll(restoredUndo);
         await _restoreTimelapseFromImageMeta(meta);
 
-        if (hasRawFill && savedWidth == _rawWidth && savedHeight == _rawHeight) {
+        if (hasRawFill &&
+            savedWidth == _rawWidth &&
+            savedHeight == _rawHeight) {
           final File imageRawFile = _imageRawFile(_currentImageIndex);
           if (await imageRawFile.exists()) {
             final Uint8List raw = await imageRawFile.readAsBytes();
             final int expectedLen = _rawWidth * _rawHeight * 4;
             if (raw.lengthInBytes == expectedLen) {
               _rawFillBytes = raw;
-              pixelEngine.updateFromRawBytes(_rawFillBytes!, _rawWidth, _rawHeight);
+              pixelEngine.updateFromRawBytes(
+                _rawFillBytes!,
+                _rawWidth,
+                _rawHeight,
+              );
               return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
             }
           }
@@ -931,9 +986,12 @@ class BasicScreenController extends ChangeNotifier {
     return null;
   }
 
-  Future<void> _restoreTimelapseFromImageMeta(Map<dynamic, dynamic> meta) async {
-    final int frameCount =
-        (meta['timelapseFrameCount'] is int) ? meta['timelapseFrameCount'] as int : 0;
+  Future<void> _restoreTimelapseFromImageMeta(
+    Map<dynamic, dynamic> meta,
+  ) async {
+    final int frameCount = (meta['timelapseFrameCount'] is int)
+        ? meta['timelapseFrameCount'] as int
+        : 0;
     if (frameCount <= 0) {
       _timelapse.clear();
       return;
@@ -973,8 +1031,14 @@ class BasicScreenController extends ChangeNotifier {
     return frame.image;
   }
 
-  Future<ui.Image> _rawRgbaToUiImage(Uint8List rgba, int width, int height) async {
-    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(rgba);
+  Future<ui.Image> _rawRgbaToUiImage(
+    Uint8List rgba,
+    int width,
+    int height,
+  ) async {
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      rgba,
+    );
     final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
       buffer,
       width: width,
@@ -995,7 +1059,9 @@ class BasicScreenController extends ChangeNotifier {
     final double imgH = _rawHeight.toDouble();
     final double viewW = _containerSize.width;
     final double viewH = _containerSize.height;
-    _cachedScaleFit = (viewW / imgW < viewH / imgH) ? viewW / imgW : viewH / imgH;
+    _cachedScaleFit = (viewW / imgW < viewH / imgH)
+        ? viewW / imgW
+        : viewH / imgH;
     _cachedFitOffsetX = (viewW - imgW * _cachedScaleFit) / 2.0;
     _cachedFitOffsetY = (viewH - imgH * _cachedScaleFit) / 2.0;
   }

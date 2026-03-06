@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutterwork/features/explore/screens/explore_screen.dart';
 
 class EmptyGallery extends StatelessWidget {
   const EmptyGallery({super.key});
@@ -22,7 +23,12 @@ class EmptyGallery extends StatelessWidget {
           ),
           const SizedBox(height: 20),
           ElevatedButton(
-            onPressed: () {},
+            onPressed: () {
+              Navigator.pushReplacement(
+        context,
+        MaterialPageRoute<void>(builder: (_) => const ExploreScreen()),
+      );
+            },
             child: const Text("Explore Illustrations"),
           )
         ],

@@ -2,23 +2,28 @@ import 'package:flutter/material.dart';
 import 'gallery_item.dart';
 
 class GalleryGrid extends StatelessWidget {
-  final List items;
+
+  final List<Map<String, dynamic>> items;
 
   const GalleryGrid({super.key, required this.items});
 
   @override
   Widget build(BuildContext context) {
+
     return GridView.builder(
       shrinkWrap: true,
-      itemCount: items.length + 1,
       physics: const NeverScrollableScrollPhysics(),
+      itemCount: items.length + 1,
+
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         crossAxisSpacing: 16,
         mainAxisSpacing: 16,
         childAspectRatio: .8,
       ),
+
       itemBuilder: (context, index) {
+
         if (index == items.length) {
           return addNewCard();
         }

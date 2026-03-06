@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutterwork/features/paint/basic_screen_controller.dart';
 import 'package:flutterwork/features/paint/widgets/paint_canvas_container.dart';
@@ -17,6 +19,7 @@ class BasicScreen extends StatefulWidget {
 
 class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   late final BasicScreenController _controller;
+  bool _isOpeningTimelapse = false;
 
   @override
   void initState() {
@@ -63,12 +66,53 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _openTimelapsePlayer() async {
+    if (_isOpeningTimelapse) return;
+    setState(() {
+      _isOpeningTimelapse = true;
+    });
+
+    try {
+      final List<Uint8List> frames = await _controller
+          .loadTimelapseFramesForPlayback();
+      if (!mounted) return;
+      if (frames.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No timelapse frames available')),
+        );
+        return;
+      }
+
+      await Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => PaintTimelapsePlayer(
+            frames: frames,
+            width: _controller.rawWidth,
+            height: _controller.rawHeight,
+          ),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Unable to open timelapse right now')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isOpeningTimelapse = false;
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _controller,
       builder: (BuildContext context, Widget? child) {
-        if (_controller.uiImage == null && _controller.showStartupLoader) {
+        if (_controller.showStartupLoader) {
           return Scaffold(
             backgroundColor: const Color(0xFF1A1A2E),
             body: const SafeArea(child: Center(child: PaintStartupLoader())),
@@ -220,6 +264,17 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                 ),
                 const SizedBox(width: 8),
               ],
+              if (_isOpeningTimelapse) ...<Widget>[
+                const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white70,
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
               _buildActionIconButton(
                 icon: Icons.undo,
                 enabled: _controller.canUndo,
@@ -240,19 +295,8 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
               const SizedBox(width: 6),
               _buildActionIconButton(
                 icon: Icons.play_circle_fill,
-                enabled: _controller.hasTimelapseFrames,
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute<void>(
-                      builder: (_) => PaintTimelapsePlayer(
-                        frames: _controller.timelapseFrames,
-                        width: _controller.rawWidth,
-                        height: _controller.rawHeight,
-                      ),
-                    ),
-                  );
-                },
+                enabled: _controller.hasTimelapseFrames && !_isOpeningTimelapse,
+                onPressed: _openTimelapsePlayer,
               ),
             ],
           ),

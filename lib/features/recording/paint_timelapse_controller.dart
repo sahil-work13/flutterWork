@@ -27,21 +27,26 @@ class PaintTimelapseController {
     isRecording = false;
   }
 
-  void setMaxFrames(int maxFrames) {
+  List<Uint8List> setMaxFrames(int maxFrames) {
+    final List<Uint8List> evicted = <Uint8List>[];
     final int next = maxFrames < 1 ? 1 : maxFrames;
-    if (next == _maxFrames) return;
+    if (next == _maxFrames) return evicted;
     _maxFrames = next;
     if (_frames.length > _maxFrames) {
-      _frames.removeRange(0, _frames.length - _maxFrames);
+      final int removeCount = _frames.length - _maxFrames;
+      evicted.addAll(_frames.take(removeCount));
+      _frames.removeRange(0, removeCount);
     }
+    return evicted;
   }
 
-  void recordFrame(Uint8List raw) {
-    if (!isRecording || raw.isEmpty) return;
+  Uint8List? recordFrame(Uint8List raw) {
+    if (!isRecording || raw.isEmpty) return null;
     _frames.add(Uint8List.fromList(raw));
     if (_frames.length > maxFrames) {
-      _frames.removeAt(0);
+      return _frames.removeAt(0);
     }
+    return null;
   }
 
   void clear() {

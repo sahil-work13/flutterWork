@@ -52,6 +52,18 @@ class _SessionMetaSnapshot {
   });
 }
 
+class _TimelapsePersistResult {
+  final int totalFrameCount;
+  final int archiveFrameCount;
+  final int tailFrameCount;
+
+  const _TimelapsePersistResult({
+    required this.totalFrameCount,
+    required this.archiveFrameCount,
+    required this.tailFrameCount,
+  });
+}
+
 class _ArchivedUndoEntry {
   final String? filePath;
   final bool isNullSnapshot;
@@ -81,9 +93,11 @@ class BasicScreenController extends ChangeNotifier {
   static const int _undoBudgetBytes = 192 * 1024 * 1024;
   static const int _persistUndoBudgetBytes = 64 * 1024 * 1024;
   static const int _persistUndoHardLimit = 240;
-  static const int _minTimelapseFrames = 300;
+  static const int _minTimelapseFrames = 24;
   static const int _maxTimelapseFramesHard = 1800;
   static const int _timelapseBudgetBytes = 256 * 1024 * 1024;
+  static const int _sessionRestoreUndoMaxEntries = 48;
+  static const int _sessionRestoreTimelapseMaxFrames = 24;
 
   final String _sessionNamespace = 'coloring_book_session_v2';
   final String _sessionMetaKey = 'session_meta';
@@ -126,6 +140,9 @@ class BasicScreenController extends ChangeNotifier {
   final Map<int, List<_ArchivedUndoEntry>> _undoArchiveByImage =
       <int, List<_ArchivedUndoEntry>>{};
   int _undoArchiveSeq = 0;
+  final Map<int, int> _timelapseArchivedFrameCountByImage = <int, int>{};
+  final Map<int, Future<void>> _timelapseArchiveWriteChainByImage =
+      <int, Future<void>>{};
   Directory _sessionDirectory = Directory.current;
   Box<dynamic>? _sessionMetaBox;
   bool _storageReady = false;
@@ -194,7 +211,9 @@ class BasicScreenController extends ChangeNotifier {
   bool get canRedo => _redoStack.isNotEmpty && !_isProcessing && _engineReady;
   bool get canRefresh => !_isProcessing && _engineReady;
   bool get canPickColor => _engineReady;
-  bool get hasTimelapseFrames => _timelapse.hasFrames;
+  bool get hasTimelapseFrames =>
+      _timelapse.hasFrames ||
+      (_timelapseArchivedFrameCountByImage[_currentImageIndex] ?? 0) > 0;
   List<Uint8List> get timelapseFrames => _timelapse.getFrames();
   int get rawWidth => _rawWidth;
   int get rawHeight => _rawHeight;
@@ -202,6 +221,10 @@ class BasicScreenController extends ChangeNotifier {
   int get progressPercent => _progressPercent;
   int get remainingPercent => 100 - _progressPercent;
   List<Color> get recentOrMostUsedColors => _buildSuggestedColors();
+  String? _borderTapMessage; // New state for the message
+  Timer? _messageTimer;      // Timer to clear the message
+
+  String? get borderTapMessage => _borderTapMessage;
 
   void init() {
     unawaited(_prepareStorageAndInit());
@@ -358,7 +381,12 @@ class BasicScreenController extends ChangeNotifier {
           _rawHeight,
         );
       }
-      _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+      final Uint8List? evictedFrame = _timelapse.recordFrame(
+        _rawFillBytes ?? pixelEngine.originalRawRgba,
+      );
+      if (evictedFrame != null) {
+        _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
+      }
       _recomputeProgressPercent();
 
       if (_disposed) {
@@ -407,7 +435,12 @@ class BasicScreenController extends ChangeNotifier {
           _rawHeight,
         );
       }
-      _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+      final Uint8List? evictedFrame = _timelapse.recordFrame(
+        _rawFillBytes ?? pixelEngine.originalRawRgba,
+      );
+      if (evictedFrame != null) {
+        _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
+      }
       _recomputeProgressPercent();
 
       if (_disposed) {
@@ -424,6 +457,17 @@ class BasicScreenController extends ChangeNotifier {
       _isProcessing = false;
       _notify();
     }
+  }
+
+  void _showBorderMessage() {
+    _messageTimer?.cancel();
+    _borderTapMessage = "Cannot fill: You've touched the border!";
+    notifyListeners(); // or _notify() if you use your private helper
+
+    _messageTimer = Timer(const Duration(seconds: 5), () {
+      _borderTapMessage = null;
+      notifyListeners();
+    });
   }
 
   Future<void> refreshCurrentImage() async {
@@ -450,6 +494,7 @@ class BasicScreenController extends ChangeNotifier {
         }
         await _deleteAllUndoFilesForImage(_currentImageIndex);
         await _clearUndoArchiveForImage(_currentImageIndex);
+        await _clearTimelapseArchiveForImage(_currentImageIndex);
         final File timelapseFile = _imageTimelapseRawFile(_currentImageIndex);
         if (await timelapseFile.exists()) {
           await timelapseFile.delete();
@@ -521,7 +566,10 @@ class BasicScreenController extends ChangeNotifier {
 
       _rawFillBytes = rawResult;
       pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
-      _timelapse.recordFrame(_rawFillBytes!);
+      final Uint8List? evictedFrame = _timelapse.recordFrame(_rawFillBytes!);
+      if (evictedFrame != null) {
+        _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
+      }
       _recomputeProgressPercent();
       final bool didChangePixels = !identical(rawResult, baseRaw);
       if (didChangePixels && _activeTool != PaintToolMode.eraser) {
@@ -537,6 +585,7 @@ class BasicScreenController extends ChangeNotifier {
         newUiImage.dispose();
         return;
       }
+      
 
       _replaceUiImage(newUiImage);
       _isProcessing = false;
@@ -550,9 +599,15 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   Future<void> loadImage({bool restoreSavedState = true}) async {
+    final Stopwatch loadPerfWatch = Stopwatch()..start();
     final int loadSeq = ++_imageLoadSeq;
     final int imageIndexAtLoad = _currentImageIndex;
     final String assetPathAtLoad = _testImages[imageIndexAtLoad];
+    ui.Image? preview;
+    _log(
+      'LOAD_PERF',
+      'START seq=$loadSeq image=$imageIndexAtLoad restore=$restoreSavedState asset=$assetPathAtLoad',
+    );
     unawaited(_clearUndoArchiveForImage(imageIndexAtLoad));
     _isImageLoading = true;
     _engineReady = false;
@@ -563,20 +618,26 @@ class BasicScreenController extends ChangeNotifier {
       final ByteData data = await rootBundle.load(assetPathAtLoad);
       if (_disposed || loadSeq != _imageLoadSeq) return;
       final Uint8List bytes = data.buffer.asUint8List();
+      _log(
+        'LOAD_PERF',
+        'asset_read bytes=${bytes.lengthInBytes} elapsed=${loadPerfWatch.elapsedMilliseconds}ms',
+      );
 
-      final ui.Image preview = await _decodeToUiImage(bytes);
+      preview = await _decodeToUiImage(bytes);
       if (_disposed || loadSeq != _imageLoadSeq) {
         preview.dispose();
+        preview = null;
         return;
       }
+      _log(
+        'LOAD_PERF',
+        'preview_decoded size=${preview.width}x${preview.height} elapsed=${loadPerfWatch.elapsedMilliseconds}ms',
+      );
 
-      _replaceUiImage(preview);
       _rawWidth = preview.width;
       _rawHeight = preview.height;
       transformationController.value = Matrix4.identity();
-      _showStartupLoader = false;
       _updateFitCache();
-      _notify();
 
       await Future<void>.delayed(Duration.zero);
       if (_disposed || loadSeq != _imageLoadSeq) return;
@@ -587,6 +648,10 @@ class BasicScreenController extends ChangeNotifier {
         bytes,
       );
       if (_disposed || loadSeq != _imageLoadSeq) return;
+      _log(
+        'LOAD_PERF',
+        'prepared_ready elapsed=${loadPerfWatch.elapsedMilliseconds}ms',
+      );
 
       pixelEngine.applyPreparedImage(prepared);
       if (!pixelEngine.isLoaded) {
@@ -597,11 +662,17 @@ class BasicScreenController extends ChangeNotifier {
       _rawHeight = pixelEngine.imageHeight;
       _undoStack.clear();
       _redoStack.clear();
-      _updateDynamicHistoryCaps();
 
+      final Stopwatch restorePerfWatch = Stopwatch()..start();
       final ui.Image? loaded = restoreSavedState
           ? await _buildCurrentImageFromSavedState()
           : null;
+      if (restoreSavedState) {
+        _log(
+          'LOAD_PERF',
+          'restore_done elapsed=${restorePerfWatch.elapsedMilliseconds}ms',
+        );
+      }
       if (_disposed || loadSeq != _imageLoadSeq) {
         loaded?.dispose();
         return;
@@ -613,26 +684,47 @@ class BasicScreenController extends ChangeNotifier {
         _targetUndoSteps = _minUndoSteps;
         _undoStack.clear();
         _redoStack.clear();
+        _timelapseArchivedFrameCountByImage[_currentImageIndex] = 0;
       }
 
-      if (loaded != null) {
-        _replaceUiImage(loaded);
-        transformationController.value = Matrix4.identity();
-        _updateFitCache();
+      final ui.Image nextImage = loaded ?? preview;
+      if (loaded == null) {
+        preview = null;
+      } else {
+        preview.dispose();
+        preview = null;
       }
+      _replaceUiImage(nextImage);
+      transformationController.value = Matrix4.identity();
+      _updateFitCache();
       if (restoreSavedState && _timelapse.hasFrames) {
         _timelapse.resume();
       } else {
         _timelapse.start();
-        _timelapse.recordFrame(_rawFillBytes ?? pixelEngine.originalRawRgba);
+        final Uint8List? evictedFrame = _timelapse.recordFrame(
+          _rawFillBytes ?? pixelEngine.originalRawRgba,
+        );
+        if (evictedFrame != null) {
+          _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
+        }
       }
+      _updateDynamicHistoryCaps();
       _recomputeProgressPercent();
 
       _engineReady = true;
+      _showStartupLoader = false;
       _showImageTransitionLoader = false;
       _notify();
+      _log(
+        'LOAD_PERF',
+        'COMPLETE seq=$loadSeq image=$imageIndexAtLoad total=${loadPerfWatch.elapsedMilliseconds}ms',
+      );
     } catch (e) {
       _log('LOAD', 'ERROR: $e');
+      _log(
+        'LOAD_PERF',
+        'FAIL seq=$loadSeq image=$imageIndexAtLoad elapsed=${loadPerfWatch.elapsedMilliseconds}ms error=$e',
+      );
       if (!_disposed && loadSeq == _imageLoadSeq) {
         _engineReady = false;
         _showStartupLoader = false;
@@ -640,6 +732,7 @@ class BasicScreenController extends ChangeNotifier {
         _notify();
       }
     } finally {
+      preview?.dispose();
       if (loadSeq == _imageLoadSeq) {
         _isImageLoading = false;
         if (_disposed) {
@@ -709,6 +802,7 @@ class BasicScreenController extends ChangeNotifier {
 
   Future<void> _flushStorageOnDispose() async {
     if (!_storageReady) return;
+    await _flushAllTimelapseArchiveWrites();
     await _scheduleSessionSave();
   }
 
@@ -726,6 +820,10 @@ class BasicScreenController extends ChangeNotifier {
 
   File _imageTimelapseRawFile(int imageIndex) => File(
     '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_timelapse.raw',
+  );
+
+  File _imageTimelapseArchiveRawFile(int imageIndex) => File(
+    '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_timelapse_archive.raw',
   );
 
   File _preparedRawFile(int imageIndex) => File(
@@ -986,7 +1084,8 @@ class BasicScreenController extends ChangeNotifier {
           i,
         ).writeAsBytes(entry, flush: true);
       }
-      final int timelapseFrameCount = await _persistTimelapseFrames(snapshot);
+      final _TimelapsePersistResult timelapsePersistResult =
+          await _persistTimelapseFrames(snapshot);
 
       final DateTime now = DateTime.now();
       final Map<String, dynamic> imageMeta = <String, dynamic>{
@@ -997,7 +1096,9 @@ class BasicScreenController extends ChangeNotifier {
         'rawWidth': snapshot.rawWidth,
         'rawHeight': snapshot.rawHeight,
         'undoKinds': undoKinds,
-        'timelapseFrameCount': timelapseFrameCount,
+        'timelapseFrameCount': timelapsePersistResult.totalFrameCount,
+        'timelapseArchiveFrameCount': timelapsePersistResult.archiveFrameCount,
+        'timelapseTailFrameCount': timelapsePersistResult.tailFrameCount,
         'undoStackPointer': snapshot.undoStack.isEmpty
             ? -1
             : snapshot.undoStack.length - 1,
@@ -1009,20 +1110,63 @@ class BasicScreenController extends ChangeNotifier {
     }
   }
 
-  Future<int> _persistTimelapseFrames(_SessionSnapshot snapshot) async {
+  Future<_TimelapsePersistResult> _persistTimelapseFrames(
+    _SessionSnapshot snapshot,
+  ) async {
     final int frameBytes = snapshot.rawWidth * snapshot.rawHeight * 4;
-    if (frameBytes <= 0) return 0;
+    if (frameBytes <= 0) {
+      return const _TimelapsePersistResult(
+        totalFrameCount: 0,
+        archiveFrameCount: 0,
+        tailFrameCount: 0,
+      );
+    }
+
+    await _flushTimelapseArchiveWrites(snapshot.imageIndex);
 
     final List<Uint8List> validFrames = snapshot.timelapseFrames
         .where((Uint8List frame) => frame.lengthInBytes == frameBytes)
         .toList(growable: false);
     final File timelapseFile = _imageTimelapseRawFile(snapshot.imageIndex);
+    final File archiveFile = _imageTimelapseArchiveRawFile(snapshot.imageIndex);
+    int archiveFrameCount = await _frameCountFromRawFile(
+      archiveFile,
+      frameBytes,
+    );
+    final int migratedPrefixFrames = await _archiveExistingTimelapsePrefix(
+      imageIndex: snapshot.imageIndex,
+      frameBytes: frameBytes,
+      keepLastFrames: validFrames.length,
+    );
+    if (migratedPrefixFrames > 0) {
+      archiveFrameCount += migratedPrefixFrames;
+      _log(
+        'TIMELAPSE_SAVE',
+        'archived_tail_prefix image=${snapshot.imageIndex} migrated=$migratedPrefixFrames',
+      );
+    }
+    _timelapseArchivedFrameCountByImage[snapshot.imageIndex] =
+        archiveFrameCount;
 
     if (validFrames.isEmpty) {
+      if (archiveFrameCount == 0) {
+        if (await timelapseFile.exists()) {
+          await timelapseFile.delete();
+        }
+        return const _TimelapsePersistResult(
+          totalFrameCount: 0,
+          archiveFrameCount: 0,
+          tailFrameCount: 0,
+        );
+      }
       if (await timelapseFile.exists()) {
         await timelapseFile.delete();
       }
-      return 0;
+      return _TimelapsePersistResult(
+        totalFrameCount: archiveFrameCount,
+        archiveFrameCount: archiveFrameCount,
+        tailFrameCount: 0,
+      );
     }
 
     final IOSink sink = timelapseFile.openWrite();
@@ -1031,7 +1175,54 @@ class BasicScreenController extends ChangeNotifier {
     }
     await sink.flush();
     await sink.close();
-    return validFrames.length;
+    return _TimelapsePersistResult(
+      totalFrameCount: archiveFrameCount + validFrames.length,
+      archiveFrameCount: archiveFrameCount,
+      tailFrameCount: validFrames.length,
+    );
+  }
+
+  Future<int> _archiveExistingTimelapsePrefix({
+    required int imageIndex,
+    required int frameBytes,
+    required int keepLastFrames,
+  }) async {
+    if (!_storageReady || frameBytes <= 0 || keepLastFrames <= 0) {
+      return 0;
+    }
+
+    final File tailFile = _imageTimelapseRawFile(imageIndex);
+    if (!await tailFile.exists()) {
+      return 0;
+    }
+
+    final int existingTailFrames = await _frameCountFromRawFile(
+      tailFile,
+      frameBytes,
+    );
+    final int framesToArchive = existingTailFrames - keepLastFrames;
+    if (framesToArchive <= 0) {
+      return 0;
+    }
+
+    final int bytesToArchive = framesToArchive * frameBytes;
+    final File archiveFile = _imageTimelapseArchiveRawFile(imageIndex);
+    final IOSink archiveSink = archiveFile.openWrite(mode: FileMode.append);
+    try {
+      await for (final List<int> chunk in tailFile.openRead(
+        0,
+        bytesToArchive,
+      )) {
+        archiveSink.add(chunk);
+      }
+      await archiveSink.flush();
+      return framesToArchive;
+    } catch (e) {
+      _log('TIMELAPSE_ARCHIVE_PREFIX', 'ERROR: $e');
+      return 0;
+    } finally {
+      await archiveSink.close();
+    }
   }
 
   Future<void> _persistSessionMetaSnapshot(
@@ -1052,6 +1243,7 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   Future<ui.Image?> _buildCurrentImageFromSavedState() async {
+    final Stopwatch restorePerfWatch = Stopwatch()..start();
     if (!_storageReady || _sessionMetaBox == null) {
       _rawFillBytes = null;
       _fillCount = 0;
@@ -1059,6 +1251,11 @@ class BasicScreenController extends ChangeNotifier {
       _undoStack.clear();
       _redoStack.clear();
       _timelapse.clear();
+      _timelapseArchivedFrameCountByImage[_currentImageIndex] = 0;
+      _log(
+        'RESTORE_PERF',
+        'SKIP image=$_currentImageIndex reason=storage_not_ready elapsed=${restorePerfWatch.elapsedMilliseconds}ms',
+      );
       return null;
     }
 
@@ -1077,6 +1274,7 @@ class BasicScreenController extends ChangeNotifier {
         final int savedHeight = (meta['rawHeight'] is int)
             ? meta['rawHeight'] as int
             : _rawHeight;
+        final int expectedFrameBytes = _rawWidth * _rawHeight * 4;
         final List<int> undoKinds = (meta['undoKinds'] is List)
             ? (meta['undoKinds'] as List)
                   .map((dynamic e) => (e is int) ? e : -1)
@@ -1085,6 +1283,35 @@ class BasicScreenController extends ChangeNotifier {
         final int undoStackPointer = (meta['undoStackPointer'] is int)
             ? meta['undoStackPointer'] as int
             : undoKinds.length - 1;
+        final int timelapseArchiveFrameCount =
+            (meta['timelapseArchiveFrameCount'] is int)
+            ? meta['timelapseArchiveFrameCount'] as int
+            : 0;
+        final int resolvedArchiveFrameCount = timelapseArchiveFrameCount > 0
+            ? timelapseArchiveFrameCount
+            : await _frameCountFromRawFile(
+                _imageTimelapseArchiveRawFile(_currentImageIndex),
+                expectedFrameBytes,
+              );
+        _timelapseArchivedFrameCountByImage[_currentImageIndex] =
+            resolvedArchiveFrameCount;
+        _log(
+          'RESTORE_PERF',
+          'meta image=$_currentImageIndex fill=$_fillCount undoKinds=${undoKinds.length} '
+              'undoPointer=$undoStackPointer archivedFrames=$resolvedArchiveFrameCount '
+              'elapsed=${restorePerfWatch.elapsedMilliseconds}ms',
+        );
+
+        final int undoEndExclusive = undoStackPointer >= 0
+            ? math.min(undoKinds.length, undoStackPointer + 1)
+            : 0;
+        final int undoStartIndex = math.max(
+          0,
+          undoEndExclusive - _sessionRestoreUndoMaxEntries,
+        );
+        final List<int> undoWindow = undoStartIndex < undoEndExclusive
+            ? undoKinds.sublist(undoStartIndex, undoEndExclusive)
+            : <int>[];
 
         final Future<List<Uint8List>?> timelapseFuture =
             _readTimelapseFramesFromImageMeta(
@@ -1092,16 +1319,19 @@ class BasicScreenController extends ChangeNotifier {
               imageIndex: _currentImageIndex,
               width: _rawWidth,
               height: _rawHeight,
+              maxFramesToRestore: _sessionRestoreTimelapseMaxFrames,
             );
 
-        final int expectedUndoBytes = _rawWidth * _rawHeight * 4;
+        final Stopwatch undoPerfWatch = Stopwatch()..start();
+        final int expectedUndoBytes = expectedFrameBytes;
         final Map<int, Future<Uint8List?>> undoReadFutures =
             <int, Future<Uint8List?>>{};
-        for (int i = 0; i < undoKinds.length; i++) {
-          if (undoKinds[i] == 1) {
+        for (int i = 0; i < undoWindow.length; i++) {
+          if (undoWindow[i] == 1) {
+            final int persistedUndoIndex = undoStartIndex + i;
             undoReadFutures[i] = _readUndoEntry(
               imageIndex: _currentImageIndex,
-              undoIndex: i,
+              undoIndex: persistedUndoIndex,
               expectedBytes: expectedUndoBytes,
             );
           }
@@ -1125,8 +1355,8 @@ class BasicScreenController extends ChangeNotifier {
         }
 
         final List<Uint8List?> restoredUndo = <Uint8List?>[];
-        for (int i = 0; i < undoKinds.length; i++) {
-          final int kind = undoKinds[i];
+        for (int i = 0; i < undoWindow.length; i++) {
+          final int kind = undoWindow[i];
           if (kind == 0) {
             restoredUndo.add(null);
             continue;
@@ -1138,26 +1368,35 @@ class BasicScreenController extends ChangeNotifier {
             }
           }
         }
-        if (undoStackPointer >= 0 && undoStackPointer < restoredUndo.length) {
-          restoredUndo.removeRange(undoStackPointer + 1, restoredUndo.length);
-        }
         _undoStack
           ..clear()
           ..addAll(restoredUndo);
         _targetUndoSteps = math.max(_minUndoSteps, _undoStack.length + 1);
         _updateDynamicHistoryCaps();
         _redoStack.clear();
+        _log(
+          'RESTORE_PERF',
+          'undo_restored count=${restoredUndo.length} window=${undoWindow.length}/$undoEndExclusive '
+              'start=$undoStartIndex elapsed=${undoPerfWatch.elapsedMilliseconds}ms',
+        );
 
+        final Stopwatch timelapsePerfWatch = Stopwatch()..start();
         final List<Uint8List>? restoredFrames = await timelapseFuture;
         if (restoredFrames != null) {
           _timelapse.replaceFrames(restoredFrames);
         } else {
           _timelapse.clear();
         }
+        _log(
+          'RESTORE_PERF',
+          'timelapse_tail_restored=${restoredFrames?.length ?? 0} '
+              'cap=$_sessionRestoreTimelapseMaxFrames elapsed=${timelapsePerfWatch.elapsedMilliseconds}ms',
+        );
 
         if (hasRawFill &&
             savedWidth == _rawWidth &&
             savedHeight == _rawHeight) {
+          final Stopwatch rawPerfWatch = Stopwatch()..start();
           final File imageRawFile = _imageRawFile(_currentImageIndex);
           if (await imageRawFile.exists()) {
             final Uint8List raw = await imageRawFile.readAsBytes();
@@ -1170,12 +1409,36 @@ class BasicScreenController extends ChangeNotifier {
                 _rawHeight,
               );
               _ensureTimelapseEndsWith(_rawFillBytes!);
-              return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
+              final ui.Image restoredImage = await _rawRgbaToUiImage(
+                _rawFillBytes!,
+                _rawWidth,
+                _rawHeight,
+              );
+              _log(
+                'RESTORE_PERF',
+                'raw_fill_restored bytes=${raw.lengthInBytes} '
+                    'rawElapsed=${rawPerfWatch.elapsedMilliseconds}ms '
+                    'total=${restorePerfWatch.elapsedMilliseconds}ms',
+              );
+              return restoredImage;
             }
           }
+          _log(
+            'RESTORE_PERF',
+            'raw_fill_missing_or_mismatch elapsed=${rawPerfWatch.elapsedMilliseconds}ms',
+          );
         }
+
+        _log(
+          'RESTORE_PERF',
+          'NO_RAW_FILL image=$_currentImageIndex total=${restorePerfWatch.elapsedMilliseconds}ms',
+        );
       } catch (e) {
         _log('RESTORE_IMAGE', 'ERROR: $e');
+        _log(
+          'RESTORE_PERF',
+          'FAIL image=$_currentImageIndex elapsed=${restorePerfWatch.elapsedMilliseconds}ms error=$e',
+        );
       }
     }
 
@@ -1185,7 +1448,12 @@ class BasicScreenController extends ChangeNotifier {
     _undoStack.clear();
     _redoStack.clear();
     _timelapse.clear();
+    _timelapseArchivedFrameCountByImage[_currentImageIndex] = 0;
     _recomputeProgressPercent();
+    _log(
+      'RESTORE_PERF',
+      'EMPTY_STATE image=$_currentImageIndex total=${restorePerfWatch.elapsedMilliseconds}ms',
+    );
     return null;
   }
 
@@ -1204,6 +1472,41 @@ class BasicScreenController extends ChangeNotifier {
     );
     await output.writeAsBytes(pngData.buffer.asUint8List(), flush: true);
     return output;
+  }
+
+  Future<List<Uint8List>> loadTimelapseFramesForPlayback() async {
+    final List<Uint8List> liveFrames = _timelapse.getFrames();
+    final int frameBytes = _rawWidth * _rawHeight * 4;
+    if (!_storageReady || frameBytes <= 0) {
+      return liveFrames;
+    }
+
+    await _flushTimelapseArchiveWrites(_currentImageIndex);
+    final List<Uint8List> archivedFrames = await _readFramesFromRawFile(
+      _imageTimelapseArchiveRawFile(_currentImageIndex),
+      frameBytes,
+    );
+    final List<Uint8List> persistedTailFrames = await _readFramesFromRawFile(
+      _imageTimelapseRawFile(_currentImageIndex),
+      frameBytes,
+    );
+    final List<Uint8List> tailFrames =
+        liveFrames.length >= persistedTailFrames.length
+        ? liveFrames
+        : persistedTailFrames;
+
+    if (archivedFrames.isEmpty) {
+      return tailFrames;
+    }
+    if (tailFrames.isEmpty) {
+      return archivedFrames;
+    }
+
+    final List<Uint8List> merged = <Uint8List>[
+      ...archivedFrames,
+      ...tailFrames,
+    ];
+    return merged;
   }
 
   Future<Uint8List?> _readUndoEntry({
@@ -1312,7 +1615,91 @@ class BasicScreenController extends ChangeNotifier {
       _minTimelapseFrames,
       _maxTimelapseFramesHard,
     );
-    _timelapse.setMaxFrames(timelapseByMemory);
+    final List<Uint8List> evictedFrames = _timelapse.setMaxFrames(
+      timelapseByMemory,
+    );
+    for (final Uint8List frame in evictedFrames) {
+      _enqueueTimelapseArchivedFrame(_currentImageIndex, frame);
+    }
+  }
+
+  void _enqueueTimelapseArchivedFrame(int imageIndex, Uint8List frame) {
+    if (!_storageReady || frame.isEmpty) return;
+    final int frameBytes = _rawWidth * _rawHeight * 4;
+    if (frameBytes <= 0 || frame.lengthInBytes != frameBytes) return;
+
+    final Future<void> previous =
+        _timelapseArchiveWriteChainByImage[imageIndex] ?? Future<void>.value();
+    _timelapseArchiveWriteChainByImage[imageIndex] = previous
+        .then((_) async {
+          await _imageTimelapseArchiveRawFile(
+            imageIndex,
+          ).writeAsBytes(frame, mode: FileMode.append, flush: false);
+          _timelapseArchivedFrameCountByImage[imageIndex] =
+              (_timelapseArchivedFrameCountByImage[imageIndex] ?? 0) + 1;
+        })
+        .catchError((Object e) {
+          _log('TIMELAPSE_ARCHIVE_WRITE', 'ERROR: $e');
+        });
+  }
+
+  Future<void> _flushTimelapseArchiveWrites(int imageIndex) async {
+    final Future<void>? pending =
+        _timelapseArchiveWriteChainByImage[imageIndex];
+    if (pending == null) return;
+    try {
+      await pending;
+    } catch (e) {
+      _log('TIMELAPSE_ARCHIVE_FLUSH', 'ERROR: $e');
+    }
+    if (identical(_timelapseArchiveWriteChainByImage[imageIndex], pending)) {
+      _timelapseArchiveWriteChainByImage.remove(imageIndex);
+    }
+  }
+
+  Future<void> _flushAllTimelapseArchiveWrites() async {
+    final List<int> imageIndexes = _timelapseArchiveWriteChainByImage.keys
+        .toList(growable: false);
+    for (final int imageIndex in imageIndexes) {
+      await _flushTimelapseArchiveWrites(imageIndex);
+    }
+  }
+
+  Future<void> _clearTimelapseArchiveForImage(int imageIndex) async {
+    await _flushTimelapseArchiveWrites(imageIndex);
+    final File archiveFile = _imageTimelapseArchiveRawFile(imageIndex);
+    if (await archiveFile.exists()) {
+      await archiveFile.delete();
+    }
+    _timelapseArchivedFrameCountByImage[imageIndex] = 0;
+  }
+
+  Future<int> _frameCountFromRawFile(File file, int frameBytes) async {
+    if (!await file.exists() || frameBytes <= 0) return 0;
+    final int bytes = await file.length();
+    return bytes ~/ frameBytes;
+  }
+
+  Future<List<Uint8List>> _readFramesFromRawFile(
+    File file,
+    int frameBytes,
+  ) async {
+    if (!await file.exists() || frameBytes <= 0) {
+      return <Uint8List>[];
+    }
+    final Uint8List raw = await file.readAsBytes();
+    final int frameCount = raw.lengthInBytes ~/ frameBytes;
+    if (frameCount <= 0) {
+      return <Uint8List>[];
+    }
+
+    final List<Uint8List> frames = <Uint8List>[];
+    for (int i = 0; i < frameCount; i++) {
+      final int start = i * frameBytes;
+      final int end = start + frameBytes;
+      frames.add(Uint8List.sublistView(raw, start, end));
+    }
+    return frames;
   }
 
   bool _hasArchivedUndo(int imageIndex) {
@@ -1513,6 +1900,7 @@ class BasicScreenController extends ChangeNotifier {
     required int imageIndex,
     required int width,
     required int height,
+    required int maxFramesToRestore,
   }) async {
     final int frameCountFromMeta = (meta['timelapseFrameCount'] is int)
         ? meta['timelapseFrameCount'] as int
@@ -1544,7 +1932,13 @@ class BasicScreenController extends ChangeNotifier {
     }
 
     // Only hydrate the tail that can actually be used by the timelapse controller.
-    final int framesToLoad = math.min(safeFrames, _timelapse.maxFrames);
+    final int capFrames = maxFramesToRestore < 1
+        ? _timelapse.maxFrames
+        : maxFramesToRestore;
+    final int framesToLoad = math.min(
+      math.min(safeFrames, _timelapse.maxFrames),
+      capFrames,
+    );
     final int bytesToLoad = framesToLoad * frameBytes;
     final int endOffset = safeFrames * frameBytes;
     final int startOffset = endOffset - bytesToLoad;

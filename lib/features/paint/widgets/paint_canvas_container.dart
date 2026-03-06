@@ -76,31 +76,19 @@ class PaintCanvasContainer extends StatelessWidget {
                 child: Stack(
                   fit: StackFit.expand,
                   children: <Widget>[
-                    image == null
-                        ? const Center(child: CircularProgressIndicator())
-                        : Listener(
-                            onPointerDown: onPointerDown,
-                            onPointerMove: onPointerMove,
-                            onPointerUp: onPointerUp,
-                            onPointerCancel: onPointerCancel,
-                            child: InteractiveViewer(
-                              transformationController:
-                                  transformationController,
-                              panEnabled: true,
-                              minScale: 1.0,
-                              maxScale: 10.0,
-                              child: SizedBox(
-                                width: canvasWidth,
-                                height: canvasHeight,
-                                child: Center(
-                                  child: RawImage(
-                                    image: image,
-                                    fit: BoxFit.contain,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 180),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder:
+                          (Widget child, Animation<double> animation) {
+                            return FadeTransition(
+                              opacity: animation,
+                              child: child,
+                            );
+                          },
+                      child: _buildCanvasContent(canvasWidth, canvasHeight),
+                    ),
                     PaintImageTransitionLoader(
                       visible: showImageTransitionLoader,
                     ),
@@ -110,6 +98,36 @@ class PaintCanvasContainer extends StatelessWidget {
             ),
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildCanvasContent(double canvasWidth, double canvasHeight) {
+    if (image == null) {
+      return const Center(
+        key: ValueKey<String>('paint_canvas_loader'),
+        child: CircularProgressIndicator(),
+      );
+    }
+
+    return Listener(
+      key: ValueKey<int>(image.hashCode),
+      onPointerDown: onPointerDown,
+      onPointerMove: onPointerMove,
+      onPointerUp: onPointerUp,
+      onPointerCancel: onPointerCancel,
+      child: InteractiveViewer(
+        transformationController: transformationController,
+        panEnabled: true,
+        minScale: 1.0,
+        maxScale: 10.0,
+        child: SizedBox(
+          width: canvasWidth,
+          height: canvasHeight,
+          child: Center(
+            child: RawImage(image: image, fit: BoxFit.contain),
+          ),
+        ),
       ),
     );
   }

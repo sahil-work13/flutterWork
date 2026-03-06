@@ -74,12 +74,12 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
     if (mounted) setState(() {});
   }
 
-  void _stopPlayback() {
+  void _stopPlayback({bool notify = true}) {
     _timer?.cancel();
     _timer = null;
     if (_isPlaying) {
       _isPlaying = false;
-      if (mounted) setState(() {});
+      if (notify && mounted) setState(() {});
     }
   }
 
@@ -229,7 +229,7 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
 
   @override
   void dispose() {
-    _stopPlayback();
+    _stopPlayback(notify: false);
     _replaceCurrentImage(null);
     super.dispose();
   }

@@ -1,11 +1,13 @@
 import 'dart:typed_data';
 
 class PaintTimelapseController {
-  PaintTimelapseController({this.maxFrames = 300});
+  PaintTimelapseController({int maxFrames = 300}) : _maxFrames = maxFrames;
 
   /// Memory per frame in bytes: `width * height * 4` (RGBA8888).
   /// Total memory upper bound: `maxFrames * width * height * 4`.
-  final int maxFrames;
+  int _maxFrames;
+
+  int get maxFrames => _maxFrames;
 
   final List<Uint8List> _frames = <Uint8List>[];
   bool isRecording = false;
@@ -23,6 +25,15 @@ class PaintTimelapseController {
 
   void stop() {
     isRecording = false;
+  }
+
+  void setMaxFrames(int maxFrames) {
+    final int next = maxFrames < 1 ? 1 : maxFrames;
+    if (next == _maxFrames) return;
+    _maxFrames = next;
+    if (_frames.length > _maxFrames) {
+      _frames.removeRange(0, _frames.length - _maxFrames);
+    }
   }
 
   void recordFrame(Uint8List raw) {

@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -50,7 +52,39 @@ class _SessionMetaSnapshot {
   });
 }
 
+class _ArchivedUndoEntry {
+  final String? filePath;
+  final bool isNullSnapshot;
+
+  const _ArchivedUndoEntry._({
+    required this.filePath,
+    required this.isNullSnapshot,
+  });
+
+  const _ArchivedUndoEntry.nullSnapshot()
+    : this._(filePath: null, isNullSnapshot: true);
+
+  const _ArchivedUndoEntry.file(String path)
+    : this._(filePath: path, isNullSnapshot: false);
+}
+
+class _ArchivedUndoReadResult {
+  final bool found;
+  final Uint8List? snapshot;
+
+  const _ArchivedUndoReadResult({required this.found, required this.snapshot});
+}
+
 class BasicScreenController extends ChangeNotifier {
+  static const int _minUndoSteps = 24;
+  static const int _maxUndoStepsHard = 1200;
+  static const int _undoBudgetBytes = 192 * 1024 * 1024;
+  static const int _persistUndoBudgetBytes = 64 * 1024 * 1024;
+  static const int _persistUndoHardLimit = 240;
+  static const int _minTimelapseFrames = 300;
+  static const int _maxTimelapseFramesHard = 1800;
+  static const int _timelapseBudgetBytes = 256 * 1024 * 1024;
+
   final String _sessionNamespace = 'coloring_book_session_v2';
   final String _sessionMetaKey = 'session_meta';
   final String _imageMetaKeyPrefix = 'image_meta_';
@@ -71,7 +105,7 @@ class BasicScreenController extends ChangeNotifier {
 
   final List<Uint8List?> _undoStack = <Uint8List?>[];
   final List<Uint8List?> _redoStack = <Uint8List?>[];
-  final int _maxUndoSteps = 20;
+  int _targetUndoSteps = _minUndoSteps;
 
   int _fillCount = 0;
   Color _selectedColor = const Color(0xFFFFC107);
@@ -89,6 +123,9 @@ class BasicScreenController extends ChangeNotifier {
   final Map<int, _SessionSnapshot> _pendingImageSnapshots =
       <int, _SessionSnapshot>{};
   _SessionMetaSnapshot? _pendingSessionMeta;
+  final Map<int, List<_ArchivedUndoEntry>> _undoArchiveByImage =
+      <int, List<_ArchivedUndoEntry>>{};
+  int _undoArchiveSeq = 0;
   Directory _sessionDirectory = Directory.current;
   Box<dynamic>? _sessionMetaBox;
   bool _storageReady = false;
@@ -150,7 +187,10 @@ class BasicScreenController extends ChangeNotifier {
   bool get showStartupLoader => _showStartupLoader;
   bool get showImageTransitionLoader => _showImageTransitionLoader;
   List<Color> get colorHistory => _colorHistory;
-  bool get canUndo => _undoStack.isNotEmpty && !_isProcessing && _engineReady;
+  bool get canUndo =>
+      (_undoStack.isNotEmpty || _hasArchivedUndo(_currentImageIndex)) &&
+      !_isProcessing &&
+      _engineReady;
   bool get canRedo => _redoStack.isNotEmpty && !_isProcessing && _engineReady;
   bool get canRefresh => !_isProcessing && _engineReady;
   bool get canPickColor => _engineReady;
@@ -280,7 +320,17 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   Future<void> undo() async {
-    if (_undoStack.isEmpty || _isProcessing || !_engineReady) return;
+    if (_isProcessing || !_engineReady) return;
+    if (_undoStack.isEmpty) {
+      final _ArchivedUndoReadResult archived = await _popArchivedUndoSnapshot(
+        _currentImageIndex,
+        expectedBytes: _rawWidth * _rawHeight * 4,
+      );
+      if (archived.found) {
+        _undoStack.add(archived.snapshot);
+      }
+    }
+    if (_undoStack.isEmpty) return;
 
     _isProcessing = true;
     _notify();
@@ -334,6 +384,7 @@ class BasicScreenController extends ChangeNotifier {
     _notify();
     try {
       final Uint8List? snapshot = _redoStack.removeLast();
+      _growUndoTargetForAction();
       _pushUndoSnapshot(_rawFillBytes);
       _fillCount++;
 
@@ -380,16 +431,25 @@ class BasicScreenController extends ChangeNotifier {
     try {
       if (_storageReady) {
         final File rawFile = _imageRawFile(_currentImageIndex);
+        int undoEntryCount = 0;
         if (_sessionMetaBox != null) {
+          final dynamic rawMeta = _sessionMetaBox!.get(
+            _imageMetaKey(_currentImageIndex),
+          );
+          if (rawMeta is Map && rawMeta['undoKinds'] is List) {
+            undoEntryCount = (rawMeta['undoKinds'] as List).length;
+          }
           await _sessionMetaBox!.delete(_imageMetaKey(_currentImageIndex));
         }
         if (await rawFile.exists()) await rawFile.delete();
-        for (int i = 0; i < _maxUndoSteps; i++) {
+        for (int i = 0; i < undoEntryCount; i++) {
           final File undoFile = _imageUndoRawFile(_currentImageIndex, i);
           if (await undoFile.exists()) {
             await undoFile.delete();
           }
         }
+        await _deleteAllUndoFilesForImage(_currentImageIndex);
+        await _clearUndoArchiveForImage(_currentImageIndex);
         final File timelapseFile = _imageTimelapseRawFile(_currentImageIndex);
         if (await timelapseFile.exists()) {
           await timelapseFile.delete();
@@ -423,6 +483,7 @@ class BasicScreenController extends ChangeNotifier {
 
     try {
       _fillCount++;
+      _growUndoTargetForAction();
       final Uint8List? snapshot = _rawFillBytes;
       _pushUndoSnapshot(snapshot);
       _redoStack.clear();
@@ -492,6 +553,7 @@ class BasicScreenController extends ChangeNotifier {
     final int loadSeq = ++_imageLoadSeq;
     final int imageIndexAtLoad = _currentImageIndex;
     final String assetPathAtLoad = _testImages[imageIndexAtLoad];
+    unawaited(_clearUndoArchiveForImage(imageIndexAtLoad));
     _isImageLoading = true;
     _engineReady = false;
     _showImageTransitionLoader = !_showStartupLoader && _uiImage != null;
@@ -535,6 +597,7 @@ class BasicScreenController extends ChangeNotifier {
       _rawHeight = pixelEngine.imageHeight;
       _undoStack.clear();
       _redoStack.clear();
+      _updateDynamicHistoryCaps();
 
       final ui.Image? loaded = restoreSavedState
           ? await _buildCurrentImageFromSavedState()
@@ -547,6 +610,7 @@ class BasicScreenController extends ChangeNotifier {
       if (!restoreSavedState) {
         _rawFillBytes = null;
         _fillCount = 0;
+        _targetUndoSteps = _minUndoSteps;
         _undoStack.clear();
         _redoStack.clear();
       }
@@ -696,8 +760,11 @@ class BasicScreenController extends ChangeNotifier {
       final File maskFile = _preparedMaskFile(imageIndex);
       if (!await rawFile.exists() || !await maskFile.exists()) return null;
 
-      final Uint8List raw = await rawFile.readAsBytes();
-      final Uint8List borderMask = await maskFile.readAsBytes();
+      final List<Uint8List> preparedBytes = await Future.wait<Uint8List>(
+        <Future<Uint8List>>[rawFile.readAsBytes(), maskFile.readAsBytes()],
+      );
+      final Uint8List raw = preparedBytes[0];
+      final Uint8List borderMask = preparedBytes[1];
       final int pixelCount = width * height;
       if (raw.lengthInBytes != pixelCount * 4 ||
           borderMask.lengthInBytes != pixelCount) {
@@ -814,7 +881,7 @@ class BasicScreenController extends ChangeNotifier {
       rawWidth: _rawWidth,
       rawHeight: _rawHeight,
       rawFillBytes: _rawFillBytes,
-      undoStack: List<Uint8List?>.from(_undoStack),
+      undoStack: _buildUndoStackForPersistence(),
       timelapseFrames: _timelapse.getFrames(),
     );
   }
@@ -890,10 +957,19 @@ class BasicScreenController extends ChangeNotifier {
         await imageRawFile.delete();
       }
 
-      for (int i = 0; i < _maxUndoSteps; i++) {
-        final File undoFile = _imageUndoRawFile(snapshot.imageIndex, i);
-        if (await undoFile.exists()) {
-          await undoFile.delete();
+      int previousUndoCount = 0;
+      final dynamic previousMeta = _sessionMetaBox!.get(
+        _imageMetaKey(snapshot.imageIndex),
+      );
+      if (previousMeta is Map && previousMeta['undoKinds'] is List) {
+        previousUndoCount = (previousMeta['undoKinds'] as List).length;
+      }
+      if (previousUndoCount > snapshot.undoStack.length) {
+        for (int i = snapshot.undoStack.length; i < previousUndoCount; i++) {
+          final File undoFile = _imageUndoRawFile(snapshot.imageIndex, i);
+          if (await undoFile.exists()) {
+            await undoFile.delete();
+          }
         }
       }
 
@@ -979,6 +1055,7 @@ class BasicScreenController extends ChangeNotifier {
     if (!_storageReady || _sessionMetaBox == null) {
       _rawFillBytes = null;
       _fillCount = 0;
+      _targetUndoSteps = _minUndoSteps;
       _undoStack.clear();
       _redoStack.clear();
       _timelapse.clear();
@@ -1009,6 +1086,44 @@ class BasicScreenController extends ChangeNotifier {
             ? meta['undoStackPointer'] as int
             : undoKinds.length - 1;
 
+        final Future<List<Uint8List>?> timelapseFuture =
+            _readTimelapseFramesFromImageMeta(
+              meta,
+              imageIndex: _currentImageIndex,
+              width: _rawWidth,
+              height: _rawHeight,
+            );
+
+        final int expectedUndoBytes = _rawWidth * _rawHeight * 4;
+        final Map<int, Future<Uint8List?>> undoReadFutures =
+            <int, Future<Uint8List?>>{};
+        for (int i = 0; i < undoKinds.length; i++) {
+          if (undoKinds[i] == 1) {
+            undoReadFutures[i] = _readUndoEntry(
+              imageIndex: _currentImageIndex,
+              undoIndex: i,
+              expectedBytes: expectedUndoBytes,
+            );
+          }
+        }
+        final Map<int, Uint8List?> undoReadResults = <int, Uint8List?>{};
+        if (undoReadFutures.isNotEmpty) {
+          final List<MapEntry<int, Uint8List?>> resolved =
+              await Future.wait<MapEntry<int, Uint8List?>>(
+                undoReadFutures.entries.map((
+                  MapEntry<int, Future<Uint8List?>> entry,
+                ) async {
+                  return MapEntry<int, Uint8List?>(
+                    entry.key,
+                    await entry.value,
+                  );
+                }),
+              );
+          for (final MapEntry<int, Uint8List?> entry in resolved) {
+            undoReadResults[entry.key] = entry.value;
+          }
+        }
+
         final List<Uint8List?> restoredUndo = <Uint8List?>[];
         for (int i = 0; i < undoKinds.length; i++) {
           final int kind = undoKinds[i];
@@ -1017,10 +1132,8 @@ class BasicScreenController extends ChangeNotifier {
             continue;
           }
           if (kind == 1) {
-            final File undoFile = _imageUndoRawFile(_currentImageIndex, i);
-            if (!await undoFile.exists()) continue;
-            final Uint8List rawUndo = await undoFile.readAsBytes();
-            if (rawUndo.lengthInBytes == _rawWidth * _rawHeight * 4) {
+            final Uint8List? rawUndo = undoReadResults[i];
+            if (rawUndo != null) {
               restoredUndo.add(rawUndo);
             }
           }
@@ -1031,8 +1144,16 @@ class BasicScreenController extends ChangeNotifier {
         _undoStack
           ..clear()
           ..addAll(restoredUndo);
+        _targetUndoSteps = math.max(_minUndoSteps, _undoStack.length + 1);
+        _updateDynamicHistoryCaps();
         _redoStack.clear();
-        await _restoreTimelapseFromImageMeta(meta);
+
+        final List<Uint8List>? restoredFrames = await timelapseFuture;
+        if (restoredFrames != null) {
+          _timelapse.replaceFrames(restoredFrames);
+        } else {
+          _timelapse.clear();
+        }
 
         if (hasRawFill &&
             savedWidth == _rawWidth &&
@@ -1048,6 +1169,7 @@ class BasicScreenController extends ChangeNotifier {
                 _rawWidth,
                 _rawHeight,
               );
+              _ensureTimelapseEndsWith(_rawFillBytes!);
               return _rawRgbaToUiImage(_rawFillBytes!, _rawWidth, _rawHeight);
             }
           }
@@ -1059,6 +1181,7 @@ class BasicScreenController extends ChangeNotifier {
 
     _rawFillBytes = null;
     _fillCount = 0;
+    _targetUndoSteps = _minUndoSteps;
     _undoStack.clear();
     _redoStack.clear();
     _timelapse.clear();
@@ -1083,16 +1206,224 @@ class BasicScreenController extends ChangeNotifier {
     return output;
   }
 
-  void _pushUndoSnapshot(Uint8List? snapshot) {
-    if (_undoStack.length >= _maxUndoSteps) {
-      if (_undoStack.isNotEmpty && _undoStack.first == null) {
-        if (_undoStack.length > 1) {
-          _undoStack.removeAt(1);
-        } else {
-          _undoStack.removeAt(0);
+  Future<Uint8List?> _readUndoEntry({
+    required int imageIndex,
+    required int undoIndex,
+    required int expectedBytes,
+  }) async {
+    final File undoFile = _imageUndoRawFile(imageIndex, undoIndex);
+    if (!await undoFile.exists()) return null;
+    final Uint8List rawUndo = await undoFile.readAsBytes();
+    if (rawUndo.lengthInBytes != expectedBytes) return null;
+    return rawUndo;
+  }
+
+  void _ensureTimelapseEndsWith(Uint8List targetRaw) {
+    final List<Uint8List> frames = _timelapse.getFrames();
+    if (frames.isEmpty) return;
+
+    final Uint8List last = frames.last;
+    if (_rawEquals(last, targetRaw)) return;
+
+    final List<Uint8List> merged = List<Uint8List>.from(frames);
+    merged.add(Uint8List.fromList(targetRaw));
+    _timelapse.replaceFrames(merged);
+  }
+
+  bool _rawEquals(Uint8List a, Uint8List b) {
+    if (identical(a, b)) return true;
+    if (a.lengthInBytes != b.lengthInBytes) return false;
+    for (int i = 0; i < a.lengthInBytes; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  void _growUndoTargetForAction() {
+    _targetUndoSteps = math.min(_maxUndoStepsHard, _targetUndoSteps + 1);
+  }
+
+  int _runtimeUndoLimit() {
+    final int frameBytes = _rawWidth * _rawHeight * 4;
+    if (frameBytes <= 0) {
+      return _targetUndoSteps.clamp(_minUndoSteps, _maxUndoStepsHard);
+    }
+    final int memoryCap = (_undoBudgetBytes ~/ frameBytes).clamp(
+      _minUndoSteps,
+      _maxUndoStepsHard,
+    );
+    if (_targetUndoSteps > memoryCap) {
+      _targetUndoSteps = memoryCap;
+    }
+    return _targetUndoSteps.clamp(_minUndoSteps, memoryCap);
+  }
+
+  int _persistUndoLimit() {
+    final int frameBytes = _rawWidth * _rawHeight * 4;
+    if (frameBytes <= 0) {
+      return _minUndoSteps;
+    }
+    return (_persistUndoBudgetBytes ~/ frameBytes).clamp(
+      _minUndoSteps,
+      _persistUndoHardLimit,
+    );
+  }
+
+  List<Uint8List?> _buildUndoStackForPersistence() {
+    if (_undoStack.isEmpty) return <Uint8List?>[];
+    final int limit = _persistUndoLimit();
+    if (_undoStack.length <= limit) {
+      return List<Uint8List?>.from(_undoStack);
+    }
+    return List<Uint8List?>.from(_undoStack.sublist(_undoStack.length - limit));
+  }
+
+  Future<void> _deleteAllUndoFilesForImage(int imageIndex) async {
+    final String prefix = '$_sessionNamespace.image_${imageIndex}_undo_';
+    await for (final FileSystemEntity entity in _sessionDirectory.list(
+      followLinks: false,
+    )) {
+      if (entity is! File) continue;
+      final List<String> parts = entity.uri.pathSegments;
+      if (parts.isEmpty) continue;
+      final String fileName = parts.last;
+      if (fileName.startsWith(prefix) && fileName.endsWith('.raw')) {
+        await entity.delete();
+      }
+    }
+  }
+
+  void _updateDynamicHistoryCaps() {
+    final int frameBytes = _rawWidth * _rawHeight * 4;
+    if (frameBytes <= 0) return;
+
+    final int undoByMemory = (_undoBudgetBytes ~/ frameBytes).clamp(
+      _minUndoSteps,
+      _maxUndoStepsHard,
+    );
+    if (_targetUndoSteps > undoByMemory) {
+      _targetUndoSteps = undoByMemory;
+      if (_undoStack.length > _targetUndoSteps) {
+        _undoStack.removeRange(0, _undoStack.length - _targetUndoSteps);
+      }
+    }
+
+    final int timelapseByMemory = (_timelapseBudgetBytes ~/ frameBytes).clamp(
+      _minTimelapseFrames,
+      _maxTimelapseFramesHard,
+    );
+    _timelapse.setMaxFrames(timelapseByMemory);
+  }
+
+  bool _hasArchivedUndo(int imageIndex) {
+    final List<_ArchivedUndoEntry>? archive = _undoArchiveByImage[imageIndex];
+    return archive != null && archive.isNotEmpty;
+  }
+
+  Future<void> _archiveUndoSnapshot(int imageIndex, Uint8List? snapshot) async {
+    final List<_ArchivedUndoEntry> archive = _undoArchiveByImage.putIfAbsent(
+      imageIndex,
+      () => <_ArchivedUndoEntry>[],
+    );
+    if (snapshot == null) {
+      archive.add(const _ArchivedUndoEntry.nullSnapshot());
+      return;
+    }
+    if (!_storageReady) {
+      // If storage is not ready, keep the chain coherent with a null marker.
+      archive.add(const _ArchivedUndoEntry.nullSnapshot());
+      return;
+    }
+
+    final String filePath =
+        '${_sessionDirectory.path}${Platform.pathSeparator}$_sessionNamespace.image_${imageIndex}_undo_archive_${_undoArchiveSeq++}.raw';
+    final File archiveFile = File(filePath);
+    try {
+      await archiveFile.writeAsBytes(snapshot, flush: false);
+      archive.add(_ArchivedUndoEntry.file(filePath));
+    } catch (e) {
+      _log('UNDO_ARCHIVE_WRITE', 'ERROR: $e');
+      archive.add(const _ArchivedUndoEntry.nullSnapshot());
+    }
+  }
+
+  Future<_ArchivedUndoReadResult> _popArchivedUndoSnapshot(
+    int imageIndex, {
+    required int expectedBytes,
+  }) async {
+    final List<_ArchivedUndoEntry>? archive = _undoArchiveByImage[imageIndex];
+    if (archive == null || archive.isEmpty) {
+      return const _ArchivedUndoReadResult(found: false, snapshot: null);
+    }
+
+    while (archive.isNotEmpty) {
+      final _ArchivedUndoEntry entry = archive.removeLast();
+      if (entry.isNullSnapshot) {
+        return const _ArchivedUndoReadResult(found: true, snapshot: null);
+      }
+
+      final String? filePath = entry.filePath;
+      if (filePath == null) {
+        continue;
+      }
+      final File file = File(filePath);
+      try {
+        if (!await file.exists()) {
+          continue;
         }
-      } else {
-        _undoStack.removeAt(0);
+        final Uint8List raw = await file.readAsBytes();
+        await file.delete();
+        if (raw.lengthInBytes == expectedBytes) {
+          return _ArchivedUndoReadResult(found: true, snapshot: raw);
+        }
+      } catch (e) {
+        _log('UNDO_ARCHIVE_READ', 'ERROR: $e');
+      }
+    }
+
+    _undoArchiveByImage.remove(imageIndex);
+    return const _ArchivedUndoReadResult(found: false, snapshot: null);
+  }
+
+  Future<void> _clearUndoArchiveForImage(int imageIndex) async {
+    final List<_ArchivedUndoEntry>? archive = _undoArchiveByImage.remove(
+      imageIndex,
+    );
+    if (archive == null || archive.isEmpty) return;
+
+    for (final _ArchivedUndoEntry entry in archive) {
+      final String? filePath = entry.filePath;
+      if (filePath == null) continue;
+      try {
+        final File file = File(filePath);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (e) {
+        _log('UNDO_ARCHIVE_CLEAR', 'ERROR: $e');
+      }
+    }
+  }
+
+  Future<void> _clearAllUndoArchives() async {
+    final List<int> imageKeys = _undoArchiveByImage.keys.toList(
+      growable: false,
+    );
+    for (final int imageIndex in imageKeys) {
+      await _clearUndoArchiveForImage(imageIndex);
+    }
+  }
+
+  void _pushUndoSnapshot(Uint8List? snapshot) {
+    final int undoLimit = _runtimeUndoLimit();
+    if (_undoStack.length >= undoLimit) {
+      final int removeCount = _undoStack.length - undoLimit + 1;
+      final List<Uint8List?> overflow = List<Uint8List?>.from(
+        _undoStack.take(removeCount),
+      );
+      _undoStack.removeRange(0, removeCount);
+      for (final Uint8List? oldSnapshot in overflow) {
+        unawaited(_archiveUndoSnapshot(_currentImageIndex, oldSnapshot));
       }
     }
     _undoStack.add(snapshot);
@@ -1177,42 +1508,67 @@ class BasicScreenController extends ChangeNotifier {
     return out.take(10).toList(growable: false);
   }
 
-  Future<void> _restoreTimelapseFromImageMeta(
-    Map<dynamic, dynamic> meta,
-  ) async {
-    final int frameCount = (meta['timelapseFrameCount'] is int)
+  Future<List<Uint8List>?> _readTimelapseFramesFromImageMeta(
+    Map<dynamic, dynamic> meta, {
+    required int imageIndex,
+    required int width,
+    required int height,
+  }) async {
+    final int frameCountFromMeta = (meta['timelapseFrameCount'] is int)
         ? meta['timelapseFrameCount'] as int
         : 0;
-    if (frameCount <= 0) {
-      _timelapse.clear();
-      return;
-    }
 
-    final File timelapseFile = _imageTimelapseRawFile(_currentImageIndex);
+    final File timelapseFile = _imageTimelapseRawFile(imageIndex);
     if (!await timelapseFile.exists()) {
-      _timelapse.clear();
-      return;
+      return <Uint8List>[];
     }
 
-    final int frameBytes = _rawWidth * _rawHeight * 4;
+    final int frameBytes = width * height * 4;
     if (frameBytes <= 0) {
-      _timelapse.clear();
-      return;
+      return <Uint8List>[];
     }
 
-    final Uint8List raw = await timelapseFile.readAsBytes();
-    if (raw.lengthInBytes != frameCount * frameBytes) {
-      _timelapse.clear();
-      return;
+    final int actualFileBytes = await timelapseFile.length();
+    final int completeFramesInFile = actualFileBytes ~/ frameBytes;
+    if (completeFramesInFile <= 0) {
+      return <Uint8List>[];
+    }
+
+    // If metadata lags behind disk writes, trust complete frames available on disk.
+    final int availableFrames = frameCountFromMeta > 0
+        ? math.max(frameCountFromMeta, completeFramesInFile)
+        : completeFramesInFile;
+    final int safeFrames = math.min(availableFrames, completeFramesInFile);
+    if (safeFrames <= 0) {
+      return <Uint8List>[];
+    }
+
+    // Only hydrate the tail that can actually be used by the timelapse controller.
+    final int framesToLoad = math.min(safeFrames, _timelapse.maxFrames);
+    final int bytesToLoad = framesToLoad * frameBytes;
+    final int endOffset = safeFrames * frameBytes;
+    final int startOffset = endOffset - bytesToLoad;
+
+    final BytesBuilder builder = BytesBuilder(copy: false);
+    await for (final List<int> chunk in timelapseFile.openRead(
+      startOffset,
+      endOffset,
+    )) {
+      builder.add(chunk);
+    }
+    final Uint8List raw = builder.toBytes();
+    final int decodedFrames = raw.lengthInBytes ~/ frameBytes;
+    if (decodedFrames <= 0) {
+      return <Uint8List>[];
     }
 
     final List<Uint8List> frames = <Uint8List>[];
-    for (int i = 0; i < frameCount; i++) {
+    for (int i = 0; i < decodedFrames; i++) {
       final int start = i * frameBytes;
       final int end = start + frameBytes;
-      frames.add(Uint8List.fromList(raw.sublist(start, end)));
+      frames.add(Uint8List.sublistView(raw, start, end));
     }
-    _timelapse.replaceFrames(frames);
+    return frames;
   }
 
   Future<ui.Image> _decodeToUiImage(Uint8List bytes) async {
@@ -1276,6 +1632,7 @@ class BasicScreenController extends ChangeNotifier {
     _timelapse.stop();
     _autosaveTimer?.cancel();
     unawaited(_flushStorageOnDispose());
+    unawaited(_clearAllUndoArchives());
     _replaceUiImage(null);
     transformationController.dispose();
     super.dispose();

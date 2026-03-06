@@ -52,10 +52,9 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         );
         return;
       }
-      await Share.shareXFiles(
-        <XFile>[XFile(file.path)],
-        text: 'Check out my coloring progress!',
-      );
+      await Share.shareXFiles(<XFile>[
+        XFile(file.path),
+      ], text: 'Check out my coloring progress!');
     } catch (_) {
       if (!mounted) return;
       messenger.showSnackBar(
@@ -273,13 +272,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
             label: 'Fill',
             active: _controller.activeTool == PaintToolMode.fill,
             onTap: () => _controller.setActiveTool(PaintToolMode.fill),
-          ),
-          const SizedBox(width: 8),
-          _buildToolButton(
-            icon: Icons.brush_rounded,
-            label: 'Brush',
-            active: _controller.activeTool == PaintToolMode.brush,
-            onTap: () => _controller.setActiveTool(PaintToolMode.brush),
           ),
           const SizedBox(width: 8),
           _buildToolButton(

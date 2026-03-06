@@ -6,12 +6,13 @@ import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
 import 'package:flutterwork/core/widgets/image_card.dart';
 import 'package:flutterwork/features/explore/services/explore_catalog_service.dart';
 import 'package:flutterwork/features/explore/screens/explore_screen.dart';
+import 'package:flutterwork/features/gallery/screens/gallery_screen.dart';
 import 'package:flutterwork/features/home/widgets/categories_section.dart';
 import 'package:flutterwork/features/home/widgets/daily_challenge_card.dart';
 import 'package:flutterwork/features/home/widgets/featured_section.dart';
 import 'package:flutterwork/features/home/widgets/greeting_header.dart';
 import 'package:flutterwork/features/home/widgets/trending_section.dart';
-import 'package:flutterwork/features/paint/basic_screen.dart';
+import 'package:flutterwork/features/paint/screens/basic_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -259,11 +260,14 @@ class _HomeScreenState extends State<HomeScreen> {
         context,
         MaterialPageRoute<void>(builder: (_) => const ExploreScreen()),
       );
-      return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('This tab will be available soon.')),
-    );
+    if (index == 2) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute<void>(builder: (_) => const GalleryScreen()),
+      );
+    }
+   
   }
 
   Future<void> _loadCategories() async {

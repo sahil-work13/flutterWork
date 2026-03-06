@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutterwork/features/paint/basic_screen_controller.dart';
+import 'package:flutterwork/features/paint/controllers/basic_screen_controller.dart';
 import 'package:flutterwork/features/paint/widgets/paint_canvas_container.dart';
 import 'package:flutterwork/features/paint/widgets/paint_loader.dart';
 import 'package:flutterwork/features/paint/widgets/paint_palette_bar.dart';

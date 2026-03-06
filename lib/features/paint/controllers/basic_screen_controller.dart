@@ -8,11 +8,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
+import 'package:flutterwork/features/recording/paint_timelapse_controller.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../../engine/PixelEngine.dart';
-import '../recording/paint_timelapse_controller.dart';
 
 void _log(String tag, String msg) {
   debugPrint('[COLOR_APP][$tag] $msg');

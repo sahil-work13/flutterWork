@@ -8,6 +8,7 @@ import 'package:flutterwork/features/explore/widgets/explore_search_bar.dart';
 import 'package:flutterwork/features/gallery/screens/gallery_screen.dart';
 import 'package:flutterwork/features/home/screens/home_screen.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
+import 'package:flutterwork/features/profile/screens/profile_screen.dart';
 
 class ExploreScreen extends StatefulWidget {
   const ExploreScreen({super.key, this.initialCategory});
@@ -244,8 +245,12 @@ class _ExploreScreenState extends State<ExploreScreen> {
         MaterialPageRoute<void>(builder: (_) => const GalleryScreen()),
       );
     }
-    // ScaffoldMessenger.of(context).showSnackBar(
-    //   const SnackBar(content: Text('This tab will be available soon.')),
-    // );
+    if (index == 3) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute<void>(builder: (_) => const ProfileScreen()),
+      );
+    }
+    
   }
 }

@@ -13,6 +13,7 @@ import 'package:flutterwork/features/home/widgets/featured_section.dart';
 import 'package:flutterwork/features/home/widgets/greeting_header.dart';
 import 'package:flutterwork/features/home/widgets/trending_section.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
+import 'package:flutterwork/features/profile/screens/profile_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -267,6 +268,12 @@ class _HomeScreenState extends State<HomeScreen> {
         MaterialPageRoute<void>(builder: (_) => const GalleryScreen()),
       );
     }
+    if (index == 3) {
+    Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const ProfileScreen()),
+      );
+  }
    
   }
 

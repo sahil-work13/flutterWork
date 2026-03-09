@@ -3,6 +3,7 @@ import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
 import 'package:flutterwork/features/explore/screens/explore_screen.dart';
 import 'package:flutterwork/features/home/screens/home_screen.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
+import 'package:flutterwork/features/profile/screens/profile_screen.dart';
 
 import '../controllers/gallery_controller.dart';
 import '../widgets/gallery_header.dart';
@@ -43,6 +44,12 @@ class _GalleryScreenState extends State<GalleryScreen> {
     // REFRESH LOGIC: If already on gallery, reload data
     controller.loadGallery();
     return;
+  }
+  if (index == 3) {
+    Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const ProfileScreen()),
+      );
   }
   }
 

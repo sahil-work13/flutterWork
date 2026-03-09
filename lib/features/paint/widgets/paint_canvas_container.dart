@@ -76,19 +76,7 @@ class PaintCanvasContainer extends StatelessWidget {
                 child: Stack(
                   fit: StackFit.expand,
                   children: <Widget>[
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 180),
-                      switchInCurve: Curves.easeOutCubic,
-                      switchOutCurve: Curves.easeInCubic,
-                      transitionBuilder:
-                          (Widget child, Animation<double> animation) {
-                            return FadeTransition(
-                              opacity: animation,
-                              child: child,
-                            );
-                          },
-                      child: _buildCanvasContent(canvasWidth, canvasHeight),
-                    ),
+                    _buildCanvasContent(canvasWidth, canvasHeight),
                     PaintImageTransitionLoader(
                       visible: showImageTransitionLoader,
                     ),

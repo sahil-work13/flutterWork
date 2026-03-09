@@ -25,6 +25,17 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   late final BasicScreenController _controller;
   bool _isOpeningTimelapse = false;
 
+  Future<void> _handleBackNavigation() async {
+    await _controller.flushSessionState();
+    if (!mounted) return;
+    await Navigator.maybePop(context);
+  }
+
+  Future<bool> _handleWillPop() async {
+    await _controller.flushSessionState();
+    return true;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -132,90 +143,94 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         final int remainingPercent = _controller.remainingPercent;
         final double progressValue = progressPercent / 100.0;
 
-        return Scaffold(
-          backgroundColor: const Color(0xFF1A1A2E),
-          body: SafeArea(
-            child: Column(
-              children: <Widget>[
-                _buildTopBar(context),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 2, 18, 8),
-                  child: Column(
-                    children: <Widget>[
-                      Row(
-                        children: <Widget>[
-                          const Text(
-                            'Progress',
-                            style: TextStyle(
-                              color: Color.fromRGBO(255, 255, 255, 0.55),
-                              fontSize: 12,
+        return WillPopScope(
+          onWillPop: _handleWillPop,
+          child: Scaffold(
+            backgroundColor: const Color(0xFF1A1A2E),
+            body: SafeArea(
+              child: Column(
+                children: <Widget>[
+                  _buildTopBar(context),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 2, 18, 8),
+                    child: Column(
+                      children: <Widget>[
+                        Row(
+                          children: <Widget>[
+                            const Text(
+                              'Progress',
+                              style: TextStyle(
+                                color: Color.fromRGBO(255, 255, 255, 0.55),
+                                fontSize: 12,
+                              ),
                             ),
-                          ),
-                          const Spacer(),
-                          Text(
-                            '$progressPercent% filled',
+                            const Spacer(),
+                            Text(
+                              '$progressPercent% filled',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 2),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: Text(
+                            '$remainingPercent% remaining',
                             style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w700,
+                              color: Color.fromRGBO(255, 255, 255, 0.55),
+                              fontSize: 11,
                             ),
                           ),
-                        ],
-                      ),
-                      const SizedBox(height: 2),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: Text(
-                          '$remainingPercent% remaining',
-                          style: const TextStyle(
-                            color: Color.fromRGBO(255, 255, 255, 0.55),
-                            fontSize: 11,
+                        ),
+                        const SizedBox(height: 6),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(999),
+                          child: LinearProgressIndicator(
+                            minHeight: 6,
+                            value: progressValue,
+                            backgroundColor: Colors.white.withValues(alpha: 0.12),
+                            valueColor: const AlwaysStoppedAnimation<Color>(
+                              Color(0xFF6C63FF),
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(height: 6),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(999),
-                        child: LinearProgressIndicator(
-                          minHeight: 6,
-                          value: progressValue,
-                          backgroundColor: Colors.white.withValues(alpha: 0.12),
-                          valueColor: const AlwaysStoppedAnimation<Color>(
-                            Color(0xFF6C63FF),
-                          ),
-                        ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-                Expanded(
-                  flex: 3,
-                  child: PaintCanvasContainer(
-                    image: _controller.uiImage,
-                    imageWidth: _controller.rawWidth,
-                    imageHeight: _controller.rawHeight,
-                    transformationController:
-                        _controller.transformationController,
-                    showImageTransitionLoader:
-                        _controller.showImageTransitionLoader,
-                    onPointerDown: _controller.onPointerDown,
-                    onPointerMove: _controller.onPointerMove,
-                    onPointerUp: _controller.onPointerUp,
-                    onPointerCancel: _controller.onPointerCancel,
-                    onViewportSizeChanged: _controller.onViewportSizeChanged,
+                  _buildStatusBanner(),
+                  Expanded(
+                    flex: 3,
+                    child: PaintCanvasContainer(
+                      image: _controller.uiImage,
+                      imageWidth: _controller.rawWidth,
+                      imageHeight: _controller.rawHeight,
+                      transformationController:
+                          _controller.transformationController,
+                      showImageTransitionLoader:
+                          _controller.showImageTransitionLoader,
+                      onPointerDown: _controller.onPointerDown,
+                      onPointerMove: _controller.onPointerMove,
+                      onPointerUp: _controller.onPointerUp,
+                      onPointerCancel: _controller.onPointerCancel,
+                      onViewportSizeChanged: _controller.onViewportSizeChanged,
+                    ),
                   ),
-                ),
-                _buildToolBar(),
-                PaintPaletteBar(
-                  colorHistory: _controller.colorHistory,
-                  recentColors: _controller.recentOrMostUsedColors,
-                  selectedColor: _controller.selectedColor,
-                  onSelectColor: _controller.selectColor,
-                  onOpenColorPicker: () => _controller.showPicker(context),
-                  onPreviousImage: () => _controller.changeImage(-1),
-                  onNextImage: () => _controller.changeImage(1),
-                ),
-              ],
+                  _buildToolBar(),
+                  PaintPaletteBar(
+                    colorHistory: _controller.colorHistory,
+                    recentColors: _controller.recentOrMostUsedColors,
+                    selectedColor: _controller.selectedColor,
+                    onSelectColor: _controller.selectColor,
+                    onOpenColorPicker: () => _controller.showPicker(context),
+                    onPreviousImage: () => _controller.changeImage(-1),
+                    onNextImage: () => _controller.changeImage(1),
+                  ),
+                ],
+              ),
             ),
           ),
         );
@@ -231,7 +246,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
           _buildActionIconButton(
             icon: Icons.arrow_back,
             enabled: true,
-            onPressed: () => Navigator.maybePop(context),
+            onPressed: _handleBackNavigation,
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -285,18 +300,6 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
                 const SizedBox(width: 8),
               ],
               _buildActionIconButton(
-                icon: Icons.undo,
-                enabled: _controller.canUndo,
-                onPressed: _controller.undo,
-              ),
-              const SizedBox(width: 6),
-              // _buildActionIconButton(
-              //   icon: Icons.redo,
-              //   enabled: _controller.canRedo,
-              //   onPressed: _controller.redo,
-              // ),
-              const SizedBox(width: 6),
-              _buildActionIconButton(
                 icon: Icons.share,
                 enabled: _controller.engineReady && !_controller.isProcessing,
                 onPressed: _shareCurrentImage,
@@ -333,8 +336,52 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
             active: _controller.activeTool == PaintToolMode.eraser,
             onTap: () => _controller.setActiveTool(PaintToolMode.eraser),
           ),
+          const SizedBox(width: 8),
+          _buildToolButton(
+            icon: Icons.redo_rounded,
+            label: 'Redo',
+            active: false,
+            onTap: _controller.canRedo ? _controller.redo : null,
+          ),
         ],
       ),
+    );
+  }
+
+  Widget _buildStatusBanner() {
+    final String? message = _controller.statusMessage;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      child: message == null
+          ? const SizedBox.shrink()
+          : Padding(
+              key: ValueKey<String>(message),
+              padding: const EdgeInsets.fromLTRB(18, 0, 18, 8),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFC856).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: const Color(0xFFFFC856).withValues(alpha: 0.45),
+                    width: 1,
+                  ),
+                ),
+                child: Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
     );
   }
 

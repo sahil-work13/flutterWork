@@ -91,7 +91,10 @@ class _GalleryScreenState extends State<GalleryScreen> {
                                     hours: controller.totalHoursSpent,
                                   ),
                                   const SizedBox(height: 20),
-                                  GalleryGrid(items: galleryItems),
+                                  GalleryGrid(
+                                    items: galleryItems,
+                                    onItemClosed: controller.loadGallery,
+                                  ),
                                 ],
                               ),
                             ),

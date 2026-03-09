@@ -1,17 +1,27 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
 
 class GalleryItem extends StatelessWidget {
   final Map<String, dynamic> data;
+  final VoidCallback onClosed;
 
-  const GalleryItem({super.key, required this.data});
+  const GalleryItem({
+    super.key,
+    required this.data,
+    required this.onClosed,
+  });
 
   @override
   Widget build(BuildContext context) {
     final int imageId = data["id"];
     final int progress = data["progress"] ?? 0;
     final String title = data["title"] ?? "Artwork ${imageId + 1}";
+    final String? previewPath = data["previewPath"] as String?;
+    final File? previewFile = previewPath == null ? null : File(previewPath);
+    final bool hasPreview = previewFile != null && previewFile.existsSync();
 
     return GestureDetector(
       onTap: () {
@@ -25,7 +35,7 @@ class GalleryItem extends StatelessWidget {
               imageIndex: imageId,
             ),
           ),
-        );
+        ).then((_) => onClosed());
       },
       child: Container(
         decoration: BoxDecoration(
@@ -50,11 +60,28 @@ class GalleryItem extends StatelessWidget {
                     child: ClipRRect(
                       borderRadius:
                           const BorderRadius.vertical(top: Radius.circular(20)),
-                      child: Image.asset(
-                        CanvasImageAssets.all[imageId],
-                        fit: BoxFit.cover,
-                        width: double.infinity,
-                      ),
+                      child: hasPreview
+                          ? Image.file(
+                              previewFile!,
+                              fit: BoxFit.cover,
+                              width: double.infinity,
+                              errorBuilder: (
+                                BuildContext context,
+                                Object error,
+                                StackTrace? stackTrace,
+                              ) {
+                                return Image.asset(
+                                  CanvasImageAssets.all[imageId],
+                                  fit: BoxFit.cover,
+                                  width: double.infinity,
+                                );
+                              },
+                            )
+                          : Image.asset(
+                              CanvasImageAssets.all[imageId],
+                              fit: BoxFit.cover,
+                              width: double.infinity,
+                            ),
                     ),
                   ),
 

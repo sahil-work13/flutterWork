@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutterwork/core/storage/coloring_book_session_storage.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
 import 'package:hive/hive.dart';
+import 'dart:io';
 
 class GalleryController extends ChangeNotifier {
-  static const String sessionNamespace = 'coloring_book_session_v2';
+  static const String sessionNamespace =
+      ColoringBookSessionStorage.sessionNamespace;
 
   double totalHoursSpent = 0.0;
   int completedCount = 0;
@@ -34,21 +37,35 @@ class GalleryController extends ChangeNotifier {
         "[GALLERY_DEBUG] Starting Load. Box: ${sessionNamespace}_metadata_box");
 
     try {
-      final metaBox = await Hive.openBox('${sessionNamespace}_metadata_box');
+      final Box<dynamic> metaBox =
+          await ColoringBookSessionStorage.ensureMetaBox();
+      await metaBox.flush();
 
       debugPrint("[GALLERY_DEBUG] Box Path: ${metaBox.path}");
       debugPrint("[GALLERY_DEBUG] Total keys found: ${metaBox.length}");
 
+      final Directory sessionDir =
+          await ColoringBookSessionStorage.ensureSessionDirectory();
       final List<Map<String, dynamic>> items = [];
       int totalSeconds = 0;
 
-      for (var key in metaBox.keys) {
-        final rawData = metaBox.get(key);
+      for (final dynamic key in metaBox.keys) {
+        if (key is! String || !key.startsWith('image_meta_')) {
+          continue;
+        }
+
+        final dynamic rawData = metaBox.get(key);
         if (rawData == null) continue;
+        if (rawData is! Map) continue;
 
-        final meta = Map<String, dynamic>.from(rawData);
+        final Map<String, dynamic> meta = Map<String, dynamic>.from(rawData);
 
-        dynamic rawProgress = meta['progressPercent'] ?? 0;
+        final int imageId = meta['imageId'] as int? ?? -1;
+        if (imageId < 0 || imageId >= CanvasImageAssets.all.length) {
+          continue;
+        }
+
+        final dynamic rawProgress = meta['progressPercent'] ?? 0;
 
         int progressPercent;
 
@@ -65,20 +82,26 @@ class GalleryController extends ChangeNotifier {
         /// Only show completed artworks
         if (progressPercent >= 90) {
           totalSeconds += (meta['totalTimeSeconds'] as int? ?? 0);
-
-          final int imageId = meta['imageId'] ?? 0;
+          final File previewFile = File(
+            '${sessionDir.path}${Platform.pathSeparator}preview_$imageId.png',
+          );
 
           items.add({
             "id": imageId,
             "title": _getImageName(imageId),
             "date": _formatDate(meta['lastSaved']),
             "progress": progressPercent,
+            "previewPath": previewFile.path,
+            "lastSaved": meta['lastSaved'],
           });
         }
       }
 
-      /// Latest artwork first
-      items.sort((a, b) => b['id'].compareTo(a['id']));
+      items.sort((a, b) {
+        final DateTime aDate = _parseSortDate(a["lastSaved"]);
+        final DateTime bDate = _parseSortDate(b["lastSaved"]);
+        return bDate.compareTo(aDate);
+      });
 
       galleryItems = items;
       completedCount = items.length;
@@ -99,6 +122,17 @@ class GalleryController extends ChangeNotifier {
       return "${dt.day}/${dt.month}/${dt.year}";
     } catch (_) {
       return "Recent";
+    }
+  }
+
+  DateTime _parseSortDate(dynamic dateStr) {
+    if (dateStr == null) {
+      return DateTime.fromMillisecondsSinceEpoch(0);
+    }
+    try {
+      return DateTime.parse(dateStr.toString());
+    } catch (_) {
+      return DateTime.fromMillisecondsSinceEpoch(0);
     }
   }
 }

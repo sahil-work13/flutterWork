@@ -7,6 +7,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:flutterwork/core/storage/coloring_book_session_storage.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
 import 'package:flutterwork/features/recording/paint_timelapse_controller.dart';
 import 'package:hive/hive.dart';
@@ -24,6 +25,7 @@ class _SessionSnapshot {
   final int imageIndex;
   final int selectedColorValue;
   final int fillCount;
+  final int totalTimeSeconds;
   final int rawWidth;
   final int rawHeight;
   final Uint8List? rawFillBytes;
@@ -34,6 +36,7 @@ class _SessionSnapshot {
     required this.imageIndex,
     required this.selectedColorValue,
     required this.fillCount,
+    required this.totalTimeSeconds,
     required this.rawWidth,
     required this.rawHeight,
     required this.rawFillBytes,
@@ -88,23 +91,24 @@ class _ArchivedUndoReadResult {
 }
 
 class BasicScreenController extends ChangeNotifier {
-  static const int _minUndoSteps = 24;
-  static const int _maxUndoStepsHard = 1200;
+  static const int _maxRemovalSteps = 50;
+  static const int _minUndoSteps = _maxRemovalSteps;
+  static const int _maxUndoStepsHard = _maxRemovalSteps;
   static const int _undoBudgetBytes = 192 * 1024 * 1024;
   static const int _persistUndoBudgetBytes = 64 * 1024 * 1024;
-  static const int _persistUndoHardLimit = 240;
+  static const int _persistUndoHardLimit = _maxRemovalSteps;
   static const int _minTimelapseFrames = 24;
   static const int _maxTimelapseFramesHard = 1800;
   static const int _timelapseBudgetBytes = 256 * 1024 * 1024;
-  static const int _sessionRestoreUndoMaxEntries = 48;
+  static const int _sessionRestoreUndoMaxEntries = _maxRemovalSteps;
   static const int _sessionRestoreTimelapseMaxFrames = 24;
   DateTime? _startTime;
   int _accumulatedSeconds = 0;
-  final String _sessionNamespace = 'coloring_book_session_v2';
+  final String _sessionNamespace =
+      ColoringBookSessionStorage.sessionNamespace;
   final String _sessionMetaKey = 'session_meta';
   final String _imageMetaKeyPrefix = 'image_meta_';
   final String _preparedMetaKeyPrefix = 'prepared_meta_';
-  final String _metaBoxSuffix = '_metadata_box';
 
   final PixelEngine pixelEngine = PixelEngine();
   final PaintTimelapseController _timelapse = PaintTimelapseController();
@@ -135,6 +139,7 @@ class BasicScreenController extends ChangeNotifier {
   bool _isImageLoading = false;
   int _queuedImageDelta = 0;
   bool _isPersisting = false;
+  Future<void>? _saveLoopFuture;
   final Map<int, _SessionSnapshot> _pendingImageSnapshots =
       <int, _SessionSnapshot>{};
   _SessionMetaSnapshot? _pendingSessionMeta;
@@ -144,6 +149,7 @@ class BasicScreenController extends ChangeNotifier {
   final Map<int, int> _timelapseArchivedFrameCountByImage = <int, int>{};
   final Map<int, Future<void>> _timelapseArchiveWriteChainByImage =
       <int, Future<void>>{};
+  Future<void>? _storageInitFuture;
   Directory _sessionDirectory = Directory.current;
   Box<dynamic>? _sessionMetaBox;
   bool _storageReady = false;
@@ -216,7 +222,8 @@ class BasicScreenController extends ChangeNotifier {
       (_undoStack.isNotEmpty || _hasArchivedUndo(_currentImageIndex)) &&
       !_isProcessing &&
       _engineReady;
-  bool get canRedo => _redoStack.isNotEmpty && !_isProcessing && _engineReady;
+  bool get canRedo =>
+      !_isProcessing && _engineReady && (_undoStack.isNotEmpty || _fillCount > 0);
   bool get canRefresh => !_isProcessing && _engineReady;
   bool get canPickColor => _engineReady;
   bool get hasTimelapseFrames =>
@@ -229,21 +236,30 @@ class BasicScreenController extends ChangeNotifier {
   int get progressPercent => _progressPercent;
   int get remainingPercent => 100 - _progressPercent;
   List<Color> get recentOrMostUsedColors => _buildSuggestedColors();
-  String? _borderTapMessage; // New state for the message
-  Timer? _messageTimer; // Timer to clear the message
+  String? _statusMessage;
+  Timer? _messageTimer;
 
-  String? get borderTapMessage => _borderTapMessage;
+  String? get statusMessage => _statusMessage;
 
   void init() {
     _startTime = DateTime.now();
-    unawaited(_prepareStorageAndInit());
+    final Future<void> storageInit = _prepareStorageAndInit();
+    _storageInitFuture = storageInit;
+    unawaited(storageInit);
+  }
+
+  Future<void> flushSessionState() async {
+    _autosaveTimer?.cancel();
+    _stopTrackingTime();
+    await _awaitStorageInitialization();
+    await _scheduleSessionSave();
   }
 
   void onAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
-      _requestAutosave(immediate: true);
+      unawaited(flushSessionState());
     }
     if (state == AppLifecycleState.paused) {
       _stopTrackingTime();
@@ -257,6 +273,13 @@ class BasicScreenController extends ChangeNotifier {
       _accumulatedSeconds += DateTime.now().difference(_startTime!).inSeconds;
       _startTime = null;
     }
+  }
+
+  int _trackedTimeSeconds() {
+    if (_startTime == null) {
+      return _accumulatedSeconds;
+    }
+    return _accumulatedSeconds + DateTime.now().difference(_startTime!).inSeconds;
   }
 
   void onViewportSizeChanged(Size newSize) {
@@ -364,24 +387,27 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   Future<void> undo() async {
+    await redo();
+  }
+
+  Future<void> redo() async {
     if (_isProcessing || !_engineReady) return;
     if (_undoStack.isEmpty) {
-      final _ArchivedUndoReadResult archived = await _popArchivedUndoSnapshot(
-        _currentImageIndex,
-        expectedBytes: _rawWidth * _rawHeight * 4,
-      );
-      if (archived.found) {
-        _undoStack.add(archived.snapshot);
+      if (_fillCount > 0) {
+        _showTemporaryMessage(
+          'Use Eraser. You have reached the 50-removal limit.',
+        );
       }
+      return;
     }
-    if (_undoStack.isEmpty) return;
 
     _isProcessing = true;
     _notify();
     try {
       final Uint8List? snapshot = _undoStack.removeLast();
-      _redoStack.add(_rawFillBytes);
-      if (_fillCount > 0) _fillCount--;
+      if (_fillCount > 0) {
+        _fillCount--;
+      }
 
       ui.Image restoredImage;
       if (snapshot == null) {
@@ -418,61 +444,7 @@ class BasicScreenController extends ChangeNotifier {
       _replaceUiImage(restoredImage);
       _isProcessing = false;
       _notify();
-      _requestAutosave();
-    } catch (e) {
-      _log('UNDO', 'ERROR: $e');
-      _isProcessing = false;
-      _notify();
-    }
-  }
-
-  Future<void> redo() async {
-    if (_redoStack.isEmpty || _isProcessing || !_engineReady) return;
-
-    _isProcessing = true;
-    _notify();
-    try {
-      final Uint8List? snapshot = _redoStack.removeLast();
-      _growUndoTargetForAction();
-      _pushUndoSnapshot(_rawFillBytes);
-      _fillCount++;
-
-      ui.Image restoredImage;
-      if (snapshot == null) {
-        final Uint8List originalRaw = pixelEngine.originalRawRgba;
-        _rawFillBytes = null;
-        pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
-        restoredImage = await _rawRgbaToUiImage(
-          originalRaw,
-          _rawWidth,
-          _rawHeight,
-        );
-      } else {
-        _rawFillBytes = snapshot;
-        pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
-        restoredImage = await _rawRgbaToUiImage(
-          snapshot,
-          _rawWidth,
-          _rawHeight,
-        );
-      }
-      final Uint8List? evictedFrame = _timelapse.recordFrame(
-        _rawFillBytes ?? pixelEngine.originalRawRgba,
-      );
-      if (evictedFrame != null) {
-        _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
-      }
-      _recomputeProgressPercent();
-
-      if (_disposed) {
-        restoredImage.dispose();
-        return;
-      }
-
-      _replaceUiImage(restoredImage);
-      _isProcessing = false;
-      _notify();
-      _requestAutosave();
+      _requestAutosave(immediate: true);
     } catch (e) {
       _log('REDO', 'ERROR: $e');
       _isProcessing = false;
@@ -480,14 +452,14 @@ class BasicScreenController extends ChangeNotifier {
     }
   }
 
-  void _showBorderMessage() {
+  void _showTemporaryMessage(String message) {
     _messageTimer?.cancel();
-    _borderTapMessage = "Cannot fill: You've touched the border!";
-    notifyListeners(); // or _notify() if you use your private helper
+    _statusMessage = message;
+    _notify();
 
     _messageTimer = Timer(const Duration(seconds: 5), () {
-      _borderTapMessage = null;
-      notifyListeners();
+      _statusMessage = null;
+      _notify();
     });
   }
 
@@ -544,16 +516,18 @@ class BasicScreenController extends ChangeNotifier {
       return;
     }
 
+    final int pixelIndex = (pixelY * _rawWidth) + pixelX;
+    if (_activeTool == PaintToolMode.fill &&
+        pixelEngine.borderMask.lengthInBytes > pixelIndex &&
+        pixelEngine.borderMask[pixelIndex] == 1) {
+      _showTemporaryMessage('Fill cannot start on the border.');
+      return;
+    }
+
     _isProcessing = true;
     _notify();
 
     try {
-      _fillCount++;
-      _growUndoTargetForAction();
-      final Uint8List? snapshot = _rawFillBytes;
-      _pushUndoSnapshot(snapshot);
-      _redoStack.clear();
-
       final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
 
       final Uint8List rawResult = PixelEngine.processFloodFill(
@@ -585,6 +559,17 @@ class BasicScreenController extends ChangeNotifier {
         ),
       );
 
+      final bool didChangePixels = !identical(rawResult, baseRaw);
+      if (!didChangePixels) {
+        _isProcessing = false;
+        _notify();
+        return;
+      }
+
+      _fillCount++;
+      _growUndoTargetForAction();
+      _pushUndoSnapshot(_rawFillBytes);
+      _redoStack.clear();
       _rawFillBytes = rawResult;
       pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
       final Uint8List? evictedFrame = _timelapse.recordFrame(_rawFillBytes!);
@@ -592,7 +577,6 @@ class BasicScreenController extends ChangeNotifier {
         _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
       }
       _recomputeProgressPercent();
-      final bool didChangePixels = !identical(rawResult, baseRaw);
       if (didChangePixels && _activeTool != PaintToolMode.eraser) {
         _markColorRecent(_selectedColor, incrementUsage: true);
       }
@@ -610,7 +594,7 @@ class BasicScreenController extends ChangeNotifier {
       _replaceUiImage(newUiImage);
       _isProcessing = false;
       _notify();
-      _requestAutosave();
+      _requestAutosave(immediate: true);
     } catch (e) {
       _log('FILL', 'ERROR: $e');
       _isProcessing = false;
@@ -701,6 +685,7 @@ class BasicScreenController extends ChangeNotifier {
       if (!restoreSavedState) {
         _rawFillBytes = null;
         _fillCount = 0;
+        _accumulatedSeconds = 0;
         _targetUndoSteps = _minUndoSteps;
         _undoStack.clear();
         _redoStack.clear();
@@ -798,19 +783,9 @@ class BasicScreenController extends ChangeNotifier {
 
   Future<void> _prepareStorageAndInit() async {
     try {
-      final Directory appSupportDir = await getApplicationDocumentsDirectory();
-      final Directory sessionDir = Directory(
-        '${appSupportDir.path}${Platform.pathSeparator}$_sessionNamespace',
-      );
-      if (!await sessionDir.exists()) {
-        await sessionDir.create(recursive: true);
-      }
-      _sessionDirectory = sessionDir;
-
-      Hive.init(sessionDir.path);
-      _sessionMetaBox = await Hive.openBox<dynamic>(
-        '$_sessionNamespace$_metaBoxSuffix',
-      );
+      _sessionDirectory =
+          await ColoringBookSessionStorage.ensureSessionDirectory();
+      _sessionMetaBox = await ColoringBookSessionStorage.ensureMetaBox();
       _storageReady = true;
     } catch (e) {
       _log('STORAGE_INIT', 'ERROR: $e');
@@ -818,6 +793,18 @@ class BasicScreenController extends ChangeNotifier {
     }
 
     await _initWithRestore();
+  }
+
+  Future<void> _awaitStorageInitialization() async {
+    final Future<void>? pending = _storageInitFuture;
+    if (pending == null) {
+      return;
+    }
+    try {
+      await pending;
+    } catch (_) {
+      // Storage readiness is handled by _storageReady and persist guards.
+    }
   }
 
   Future<void> _flushStorageOnDispose() async {
@@ -996,6 +983,7 @@ class BasicScreenController extends ChangeNotifier {
       imageIndex: _currentImageIndex,
       selectedColorValue: _selectedColor.toARGB32(),
       fillCount: _fillCount,
+      totalTimeSeconds: _trackedTimeSeconds(),
       rawWidth: _rawWidth,
       rawHeight: _rawHeight,
       rawFillBytes: _rawFillBytes,
@@ -1020,47 +1008,47 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   Future<void> _requestAutosave({bool immediate = false}) async {
-  if (immediate) {
-    _autosaveTimer?.cancel();
-    unawaited(_scheduleSessionSave());
-    return;
-  }
+    _stopTrackingTime();
+    _startTime = DateTime.now();
 
-  _autosaveTimer?.cancel();
-  _autosaveTimer = Timer(_autosaveDebounce, () {
-    unawaited(_scheduleSessionSave());
-  });
-
-  _stopTrackingTime();
-  _startTime = DateTime.now();
-
-  try {
-    final metaBox = await Hive.openBox('coloring_book_session_v2_metadata_box');
-    
-    double progress = 0;
-    if (_rawFillBytes != null) {
-      progress = pixelEngine.getFillPercentage(_rawFillBytes!);
+    if (immediate) {
+      _autosaveTimer?.cancel();
+      unawaited(_scheduleSessionSave());
+      return;
     }
 
-    final String metaKey = 'image_meta_$_currentImageIndex';
-
-    await metaBox.put(metaKey, {
-      'imageId': _currentImageIndex,
-      'lastSaved': DateTime.now().toIso8601String(),
-      'progressPercent': progress,
-      'totalTimeSeconds': _accumulatedSeconds,
+    _autosaveTimer?.cancel();
+    _autosaveTimer = Timer(_autosaveDebounce, () {
+      unawaited(_scheduleSessionSave());
     });
-
-    
-
-    debugPrint("Saved successfully with progress: $progress");
-  } catch (e) {
-    debugPrint("Save Error: $e");
   }
-}
 
   Future<void> _scheduleSessionSave() async {
     _enqueueAutosaveSnapshot();
+    await _awaitStorageInitialization();
+    while (true) {
+      final Future<void>? pending = _saveLoopFuture;
+      if (pending != null) {
+        await pending;
+      } else {
+        final Future<void> saveLoop = _drainPendingSessionSaves();
+        _saveLoopFuture = saveLoop;
+        try {
+          await saveLoop;
+        } finally {
+          if (identical(_saveLoopFuture, saveLoop)) {
+            _saveLoopFuture = null;
+          }
+        }
+      }
+
+      if (_pendingImageSnapshots.isEmpty && _pendingSessionMeta == null) {
+        return;
+      }
+    }
+  }
+
+  Future<void> _drainPendingSessionSaves() async {
     if (_isPersisting) return;
 
     _isPersisting = true;
@@ -1144,6 +1132,7 @@ class BasicScreenController extends ChangeNotifier {
         'version': 2,
         'imageId': snapshot.imageIndex,
         'fillCount': snapshot.fillCount,
+        'totalTimeSeconds': snapshot.totalTimeSeconds,
         'hasRawFill': snapshot.rawFillBytes != null,
         'rawWidth': snapshot.rawWidth,
         'rawHeight': snapshot.rawHeight,
@@ -1155,6 +1144,7 @@ class BasicScreenController extends ChangeNotifier {
         'undoStackPointer': snapshot.undoStack.isEmpty
             ? -1
             : snapshot.undoStack.length - 1,
+        'lastSaved': now.toIso8601String(),
         'lastModified': now.toIso8601String(),
       };
       if (snapshot.rawFillBytes != null) {
@@ -1173,6 +1163,7 @@ class BasicScreenController extends ChangeNotifier {
         }
       }
       await _sessionMetaBox!.put(_imageMetaKey(snapshot.imageIndex), imageMeta);
+      await _sessionMetaBox!.flush();
     } catch (e) {
       _log('AUTOSAVE_IMAGE', 'ERROR: $e');
     }
@@ -1305,6 +1296,7 @@ class BasicScreenController extends ChangeNotifier {
         'lastModified': DateTime.now().toIso8601String(),
       };
       await _sessionMetaBox!.put(_sessionMetaKey, sessionMeta);
+      await _sessionMetaBox!.flush();
     } catch (e) {
       _log('AUTOSAVE_META', 'ERROR: $e');
     }
@@ -1315,6 +1307,7 @@ class BasicScreenController extends ChangeNotifier {
     if (!_storageReady || _sessionMetaBox == null) {
       _rawFillBytes = null;
       _fillCount = 0;
+      _accumulatedSeconds = 0;
       _targetUndoSteps = _minUndoSteps;
       _undoStack.clear();
       _redoStack.clear();
@@ -1335,6 +1328,9 @@ class BasicScreenController extends ChangeNotifier {
         final Map<dynamic, dynamic> meta = rawMeta;
 
         _fillCount = (meta['fillCount'] is int) ? meta['fillCount'] as int : 0;
+        _accumulatedSeconds = (meta['totalTimeSeconds'] is int)
+            ? meta['totalTimeSeconds'] as int
+            : 0;
         final bool hasRawFill = meta['hasRawFill'] == true;
         final int savedWidth = (meta['rawWidth'] is int)
             ? meta['rawWidth'] as int
@@ -1512,6 +1508,7 @@ class BasicScreenController extends ChangeNotifier {
 
     _rawFillBytes = null;
     _fillCount = 0;
+    _accumulatedSeconds = 0;
     _targetUndoSteps = _minUndoSteps;
     _undoStack.clear();
     _redoStack.clear();
@@ -1873,13 +1870,7 @@ class BasicScreenController extends ChangeNotifier {
     final int undoLimit = _runtimeUndoLimit();
     if (_undoStack.length >= undoLimit) {
       final int removeCount = _undoStack.length - undoLimit + 1;
-      final List<Uint8List?> overflow = List<Uint8List?>.from(
-        _undoStack.take(removeCount),
-      );
       _undoStack.removeRange(0, removeCount);
-      for (final Uint8List? oldSnapshot in overflow) {
-        unawaited(_archiveUndoSnapshot(_currentImageIndex, oldSnapshot));
-      }
     }
     _undoStack.add(snapshot);
   }
@@ -2093,6 +2084,8 @@ class BasicScreenController extends ChangeNotifier {
     _disposed = true;
     _timelapse.stop();
     _autosaveTimer?.cancel();
+    _messageTimer?.cancel();
+    _stopTrackingTime();
     unawaited(_flushStorageOnDispose());
     unawaited(_clearAllUndoArchives());
     _replaceUiImage(null);

@@ -4,8 +4,13 @@ import 'gallery_item.dart';
 class GalleryGrid extends StatelessWidget {
 
   final List<Map<String, dynamic>> items;
+  final VoidCallback onItemClosed;
 
-  const GalleryGrid({super.key, required this.items});
+  const GalleryGrid({
+    super.key,
+    required this.items,
+    required this.onItemClosed,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -28,7 +33,10 @@ class GalleryGrid extends StatelessWidget {
           return addNewCard();
         }
 
-        return GalleryItem(data: items[index]);
+        return GalleryItem(
+          data: items[index],
+          onClosed: onItemClosed,
+        );
       },
     );
   }

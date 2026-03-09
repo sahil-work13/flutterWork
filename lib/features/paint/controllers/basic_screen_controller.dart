@@ -98,7 +98,8 @@ class BasicScreenController extends ChangeNotifier {
   static const int _timelapseBudgetBytes = 256 * 1024 * 1024;
   static const int _sessionRestoreUndoMaxEntries = 48;
   static const int _sessionRestoreTimelapseMaxFrames = 24;
-
+  DateTime? _startTime;
+  int _accumulatedSeconds = 0;
   final String _sessionNamespace = 'coloring_book_session_v2';
   final String _sessionMetaKey = 'session_meta';
   final String _imageMetaKeyPrefix = 'image_meta_';
@@ -185,14 +186,21 @@ class BasicScreenController extends ChangeNotifier {
 
   final List<String> _testImages = List<String>.from(CanvasImageAssets.all);
 
-  BasicScreenController({String? initialImagePath})
-    : _hasExplicitInitialImage = initialImagePath != null {
-    if (initialImagePath != null) {
+  BasicScreenController({String? initialImagePath, int? imageIndex})
+    : _hasExplicitInitialImage =
+          (initialImagePath != null || imageIndex != null) {
+    // 1. Prioritize imageIndex from Gallery
+    if (imageIndex != null) {
+      _currentImageIndex = imageIndex;
+    }
+    // 2. Fallback to path if index isn't provided (e.g., coming from Explore)
+    else if (initialImagePath != null) {
       final int selectedImageIndex = _testImages.indexOf(initialImagePath);
       if (selectedImageIndex >= 0) {
         _currentImageIndex = selectedImageIndex;
       }
     }
+
     _markColorRecent(_selectedColor);
   }
 
@@ -222,11 +230,12 @@ class BasicScreenController extends ChangeNotifier {
   int get remainingPercent => 100 - _progressPercent;
   List<Color> get recentOrMostUsedColors => _buildSuggestedColors();
   String? _borderTapMessage; // New state for the message
-  Timer? _messageTimer;      // Timer to clear the message
+  Timer? _messageTimer; // Timer to clear the message
 
   String? get borderTapMessage => _borderTapMessage;
 
   void init() {
+    _startTime = DateTime.now();
     unawaited(_prepareStorageAndInit());
   }
 
@@ -235,6 +244,18 @@ class BasicScreenController extends ChangeNotifier {
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       _requestAutosave(immediate: true);
+    }
+    if (state == AppLifecycleState.paused) {
+      _stopTrackingTime();
+    } else if (state == AppLifecycleState.resumed) {
+      _startTime = DateTime.now();
+    }
+  }
+
+  void _stopTrackingTime() {
+    if (_startTime != null) {
+      _accumulatedSeconds += DateTime.now().difference(_startTime!).inSeconds;
+      _startTime = null;
     }
   }
 
@@ -585,7 +606,6 @@ class BasicScreenController extends ChangeNotifier {
         newUiImage.dispose();
         return;
       }
-      
 
       _replaceUiImage(newUiImage);
       _isProcessing = false;
@@ -999,18 +1019,45 @@ class BasicScreenController extends ChangeNotifier {
     _pendingSessionMeta = _captureSessionMetaSnapshot();
   }
 
-  void _requestAutosave({bool immediate = false}) {
-    if (immediate) {
-      _autosaveTimer?.cancel();
-      unawaited(_scheduleSessionSave());
-      return;
+  Future<void> _requestAutosave({bool immediate = false}) async {
+  if (immediate) {
+    _autosaveTimer?.cancel();
+    unawaited(_scheduleSessionSave());
+    return;
+  }
+
+  _autosaveTimer?.cancel();
+  _autosaveTimer = Timer(_autosaveDebounce, () {
+    unawaited(_scheduleSessionSave());
+  });
+
+  _stopTrackingTime();
+  _startTime = DateTime.now();
+
+  try {
+    final metaBox = await Hive.openBox('coloring_book_session_v2_metadata_box');
+    
+    double progress = 0;
+    if (_rawFillBytes != null) {
+      progress = pixelEngine.getFillPercentage(_rawFillBytes!);
     }
 
-    _autosaveTimer?.cancel();
-    _autosaveTimer = Timer(_autosaveDebounce, () {
-      unawaited(_scheduleSessionSave());
+    final String metaKey = 'image_meta_$_currentImageIndex';
+
+    await metaBox.put(metaKey, {
+      'imageId': _currentImageIndex,
+      'lastSaved': DateTime.now().toIso8601String(),
+      'progressPercent': progress,
+      'totalTimeSeconds': _accumulatedSeconds,
     });
+
+    
+
+    debugPrint("Saved successfully with progress: $progress");
+  } catch (e) {
+    debugPrint("Save Error: $e");
   }
+}
 
   Future<void> _scheduleSessionSave() async {
     _enqueueAutosaveSnapshot();
@@ -1088,6 +1135,11 @@ class BasicScreenController extends ChangeNotifier {
           await _persistTimelapseFrames(snapshot);
 
       final DateTime now = DateTime.now();
+      double progress = 0;
+
+      if (snapshot.rawFillBytes != null) {
+        progress = pixelEngine.getFillPercentage(snapshot.rawFillBytes!);
+      }
       final Map<String, dynamic> imageMeta = <String, dynamic>{
         'version': 2,
         'imageId': snapshot.imageIndex,
@@ -1095,6 +1147,7 @@ class BasicScreenController extends ChangeNotifier {
         'hasRawFill': snapshot.rawFillBytes != null,
         'rawWidth': snapshot.rawWidth,
         'rawHeight': snapshot.rawHeight,
+        'progressPercent': progress,
         'undoKinds': undoKinds,
         'timelapseFrameCount': timelapsePersistResult.totalFrameCount,
         'timelapseArchiveFrameCount': timelapsePersistResult.archiveFrameCount,
@@ -1104,6 +1157,21 @@ class BasicScreenController extends ChangeNotifier {
             : snapshot.undoStack.length - 1,
         'lastModified': now.toIso8601String(),
       };
+      if (snapshot.rawFillBytes != null) {
+        final Uint8List? png = await pixelEngine.getEncodedPng(
+          snapshot.rawFillBytes!,
+          snapshot.rawWidth,
+          snapshot.rawHeight,
+        );
+
+        if (png != null) {
+          final File previewFile = File(
+            '${_sessionDirectory.path}/preview_${snapshot.imageIndex}.png',
+          );
+
+          await previewFile.writeAsBytes(png, flush: true);
+        }
+      }
       await _sessionMetaBox!.put(_imageMetaKey(snapshot.imageIndex), imageMeta);
     } catch (e) {
       _log('AUTOSAVE_IMAGE', 'ERROR: $e');

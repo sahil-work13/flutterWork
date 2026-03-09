@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:image/image.dart' as img;
 
 class FloodFillRequest {
@@ -235,5 +237,86 @@ class PixelEngine {
       _currentRawRgba,
     );
     return Uint8List.fromList(img.encodePng(image));
+  }
+
+  double getFillPercentage(Uint8List currentRaw) {
+
+  if (currentRaw.length != originalRawRgba.length) {
+    return 0.0;
+  }
+
+  final Uint8List original = originalRawRgba;
+  final Uint8List borderMaskLocal = borderMask;
+
+  int fillablePixels = 0;
+  int paintedPixels = 0;
+
+  for (int i = 0, bi = 0; i < borderMaskLocal.length; i++, bi += 4) {
+
+    if (borderMaskLocal[i] == 1) continue;
+
+    fillablePixels++;
+
+    final bool changed =
+        currentRaw[bi] != original[bi] ||
+        currentRaw[bi + 1] != original[bi + 1] ||
+        currentRaw[bi + 2] != original[bi + 2];
+
+    if (changed) {
+      paintedPixels++;
+    }
+  }
+
+  if (fillablePixels == 0) return 0;
+
+  return (paintedPixels / fillablePixels) * 100;
+}
+
+  Future<Uint8List?> getEncodedPng(
+  Uint8List rgba,
+  int width,
+  int height,
+) async {
+
+  final ui.ImmutableBuffer buffer =
+      await ui.ImmutableBuffer.fromUint8List(rgba);
+
+  final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
+    buffer,
+    width: width,
+    height: height,
+    pixelFormat: ui.PixelFormat.rgba8888,
+  );
+
+  final ui.Codec codec = await descriptor.instantiateCodec();
+  final ui.FrameInfo frame = await codec.getNextFrame();
+
+  final ui.Image image = frame.image;
+
+  final ByteData? pngBytes =
+      await image.toByteData(format: ui.ImageByteFormat.png);
+
+  if (pngBytes == null) return null;
+
+  return pngBytes.buffer.asUint8List();
+}
+
+  Future<Uint8List> getPngBytes() async {
+    final completer = Completer<ui.Image>();
+    // 1. Convert raw pixels to a UI Image
+    ui.decodeImageFromPixels(
+      _currentRawRgba,
+      _width,
+      _height,
+      ui.PixelFormat.rgba8888,
+      (ui.Image img) => completer.complete(img),
+    );
+
+    final ui.Image image = await completer.future;
+    // 2. Convert UI Image to PNG format bytes
+    final ByteData? byteData = await image.toByteData(
+      format: ui.ImageByteFormat.png,
+    );
+    return byteData!.buffer.asUint8List();
   }
 }

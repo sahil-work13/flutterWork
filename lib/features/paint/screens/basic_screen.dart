@@ -9,10 +9,14 @@ import 'package:flutterwork/features/recording/paint_timelapse_player.dart';
 import 'package:share_plus/share_plus.dart';
 
 class BasicScreen extends StatefulWidget {
-  const BasicScreen({super.key, this.imagePath});
-
-  final String? imagePath;
-
+  
+  final String imagePath;
+  final int? imageIndex; 
+  const BasicScreen({
+    super.key, 
+    required this.imagePath, 
+    this.imageIndex, 
+  });
   @override
   State<BasicScreen> createState() => _BasicScreenState();
 }
@@ -24,7 +28,12 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    _controller = BasicScreenController(initialImagePath: widget.imagePath);
+    // Pass both values to the controller
+    _controller = BasicScreenController(
+      initialImagePath: widget.imagePath,
+      imageIndex: widget.imageIndex, 
+    );
+    
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;

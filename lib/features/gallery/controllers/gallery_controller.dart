@@ -135,4 +135,24 @@ class GalleryController extends ChangeNotifier {
       return DateTime.fromMillisecondsSinceEpoch(0);
     }
   }
+
+  String getFormattedTime() {
+  final int totalSeconds = (totalHoursSpent * 3600).round();
+
+  if (totalSeconds < 60) {
+    return "${totalSeconds}s";
+  }
+
+  if (totalSeconds < 3600) {
+    final int minutes = totalSeconds ~/ 60;
+    final int seconds = totalSeconds % 60;
+
+    return seconds == 0 ? "${minutes}m" : "${minutes}m ${seconds}s";
+  }
+
+  final int hours = totalSeconds ~/ 3600;
+  final int minutes = (totalSeconds % 3600) ~/ 60;
+
+  return "${hours}h ${minutes}m";
+}
 }

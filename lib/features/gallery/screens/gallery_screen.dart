@@ -41,27 +41,27 @@ class _GalleryScreenState extends State<GalleryScreen> {
       );
     }
     if (index == 2) {
-    // REFRESH LOGIC: If already on gallery, reload data
-    controller.loadGallery();
-    return;
-  }
-  if (index == 3) {
-    Navigator.pushReplacement(
+      // REFRESH LOGIC: If already on gallery, reload data
+      controller.loadGallery();
+      return;
+    }
+    if (index == 3) {
+      Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (_) => const ProfileScreen()),
       );
-  }
+    }
   }
 
   void _startPainting(String path) {
-  Navigator.push(
-    context,
-    MaterialPageRoute(builder: (_) => BasicScreen(imagePath: path)),
-  ).then((_) {
-    // This executes when the user returns to this screen from the painter
-    controller.loadGallery();
-  });
-}
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => BasicScreen(imagePath: path)),
+    ).then((_) {
+      // This executes when the user returns to this screen from the painter
+      controller.loadGallery();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -80,24 +80,24 @@ class _GalleryScreenState extends State<GalleryScreen> {
                   child: controller.loading
                       ? const Center(child: CircularProgressIndicator())
                       : galleryItems.isEmpty
-                          ? const EmptyGallery()
-                          : SingleChildScrollView(
-                              padding: const EdgeInsets.symmetric(horizontal: 20),
-                              child: Column(
-                                children: [
-                                  // FIXED LINE BELOW:
-                                  GalleryStats(
-                                    count: controller.completedCount,
-                                    hours: controller.totalHoursSpent,
-                                  ),
-                                  const SizedBox(height: 20),
-                                  GalleryGrid(
-                                    items: galleryItems,
-                                    onItemClosed: controller.loadGallery,
-                                  ),
-                                ],
+                      ? const EmptyGallery()
+                      : SingleChildScrollView(
+                          padding: const EdgeInsets.symmetric(horizontal: 20),
+                          child: Column(
+                            children: [
+                              // FIXED LINE BELOW:
+                              GalleryStats(
+                                count: controller.completedCount,
+                                formattedTime: controller.getFormattedTime(),
                               ),
-                            ),
+                              const SizedBox(height: 20),
+                              GalleryGrid(
+                                items: galleryItems,
+                                onItemClosed: controller.loadGallery,
+                              ),
+                            ],
+                          ),
+                        ),
                 ),
                 Align(
                   alignment: Alignment.bottomCenter,

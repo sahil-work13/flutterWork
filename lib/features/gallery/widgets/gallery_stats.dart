@@ -2,31 +2,30 @@ import 'package:flutter/material.dart';
 
 class GalleryStats extends StatelessWidget {
   final int count;
-  final double hours;
+  final String formattedTime;
 
   const GalleryStats({
-    super.key, 
-    required this.count, 
-    required this.hours,
+    super.key,
+    required this.count,
+    required this.formattedTime,
   });
 
   @override
   Widget build(BuildContext context) {
     return GridView.count(
-      crossAxisCount: 3, // Fixed: Added required argument
+      crossAxisCount: 3,
       shrinkWrap: true,
       crossAxisSpacing: 10,
       mainAxisSpacing: 10,
       physics: const NeverScrollableScrollPhysics(),
       children: [
         _statCard("🎨", "$count", "Completed"),
-        _statCard("⏱️", "${hours.toStringAsFixed(1)}h", "Time spent"),
+        _statCard("⏱️", formattedTime, "Time spent"),
         _statCard("🔥", "7", "Day streak"),
       ],
     );
   }
 
-  // Fixed: Added the missing statCard method
   Widget _statCard(String icon, String value, String label) {
     return Container(
       padding: const EdgeInsets.all(10),

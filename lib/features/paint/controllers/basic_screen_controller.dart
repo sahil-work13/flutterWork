@@ -10,7 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:flutterwork/core/storage/coloring_book_session_storage.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
-import 'package:flutterwork/features/recording/paint_timelapse_controller.dart';
+import 'package:flutterwork/features/recording/controllers/paint_timelapse_controller.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 

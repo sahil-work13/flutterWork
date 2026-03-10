@@ -5,7 +5,7 @@ import 'package:flutterwork/features/paint/controllers/basic_screen_controller.d
 import 'package:flutterwork/features/paint/widgets/paint_canvas_container.dart';
 import 'package:flutterwork/features/paint/widgets/paint_loader.dart';
 import 'package:flutterwork/features/paint/widgets/paint_palette_bar.dart';
-import 'package:flutterwork/features/recording/paint_timelapse_player.dart';
+import 'package:flutterwork/features/recording/screens/paint_timelapse_player.dart';
 import 'package:share_plus/share_plus.dart';
 
 class BasicScreen extends StatefulWidget {

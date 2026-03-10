@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
@@ -16,7 +17,9 @@ import 'package:path_provider/path_provider.dart';
 import '../../../engine/PixelEngine.dart';
 
 void _log(String tag, String msg) {
-  debugPrint('[COLOR_APP][$tag] $msg');
+  if (kDebugMode) {
+    debugPrint('[COLOR_APP][$tag] $msg');
+  }
 }
 
 enum PaintToolMode { fill, brush, eraser }
@@ -102,6 +105,8 @@ class BasicScreenController extends ChangeNotifier {
   static const int _timelapseBudgetBytes = 256 * 1024 * 1024;
   static const int _sessionRestoreUndoMaxEntries = _maxRemovalSteps;
   static const int _sessionRestoreTimelapseMaxFrames = 24;
+  static const int _floodFillIsolatePixelThreshold = 160000;
+  static const int _progressScanIsolatePixelThreshold = 200000;
   DateTime? _startTime;
   int _accumulatedSeconds = 0;
   final String _sessionNamespace =
@@ -527,11 +532,10 @@ class BasicScreenController extends ChangeNotifier {
     _isProcessing = true;
     _notify();
 
-    try {
-      final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
+      try {
+        final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
 
-      final Uint8List rawResult = PixelEngine.processFloodFill(
-        FloodFillRequest(
+      final FloodFillRequest request = FloodFillRequest(
           rawRgbaBytes: baseRaw,
           borderMask: pixelEngine.borderMask,
           x: pixelX,
@@ -556,10 +560,19 @@ class BasicScreenController extends ChangeNotifier {
                     : _selectedColor)
                 .b,
           ),
-        ),
       );
 
-      final bool didChangePixels = !identical(rawResult, baseRaw);
+      final int pixelCount = _rawWidth * _rawHeight;
+      final Map<String, Object> floodFillResult = pixelCount >=
+              _floodFillIsolatePixelThreshold
+          ? await compute<FloodFillRequest, Map<String, Object>>(
+              PixelEngine.processFloodFillToMap,
+              request,
+            )
+          : PixelEngine.processFloodFillToMap(request);
+
+      final Uint8List rawResult = floodFillResult['raw'] as Uint8List;
+      final bool didChangePixels = floodFillResult['changed'] as bool;
       if (!didChangePixels) {
         _isProcessing = false;
         _notify();
@@ -939,7 +952,11 @@ class BasicScreenController extends ChangeNotifier {
     );
     if (cached != null) return cached;
 
-    final Map<String, Object> generated = PixelEngine.decodeAndPrepare(bytes);
+    final Map<String, Object> generated =
+        await compute<Uint8List, Map<String, Object>>(
+      PixelEngine.decodeAndPrepare,
+      bytes,
+    );
     unawaited(
       _writePreparedImageCache(imageIndex, assetPath, byteLength, generated),
     );
@@ -1126,7 +1143,19 @@ class BasicScreenController extends ChangeNotifier {
       double progress = 0;
 
       if (snapshot.rawFillBytes != null) {
-        progress = pixelEngine.getFillPercentage(snapshot.rawFillBytes!);
+        final int pixelCount = snapshot.rawWidth * snapshot.rawHeight;
+        if (pixelCount >= _progressScanIsolatePixelThreshold) {
+          progress = await compute<FillPercentageRequest, double>(
+            PixelEngine.computeFillPercentage,
+            FillPercentageRequest(
+              currentRawRgba: snapshot.rawFillBytes!,
+              originalRawRgba: pixelEngine.originalRawRgba,
+              borderMask: pixelEngine.borderMask,
+            ),
+          );
+        } else {
+          progress = pixelEngine.getFillPercentage(snapshot.rawFillBytes!);
+        }
       }
       final Map<String, dynamic> imageMeta = <String, dynamic>{
         'version': 2,
@@ -1163,7 +1192,6 @@ class BasicScreenController extends ChangeNotifier {
         }
       }
       await _sessionMetaBox!.put(_imageMetaKey(snapshot.imageIndex), imageMeta);
-      await _sessionMetaBox!.flush();
     } catch (e) {
       _log('AUTOSAVE_IMAGE', 'ERROR: $e');
     }

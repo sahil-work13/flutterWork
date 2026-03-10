@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutterwork/core/navigation/main_navigation_screen.dart';
 import 'package:flutterwork/features/explore/screens/explore_screen.dart';
 
 class EmptyGallery extends StatelessWidget {
@@ -24,10 +25,16 @@ class EmptyGallery extends StatelessWidget {
           const SizedBox(height: 20),
           ElevatedButton(
             onPressed: () {
+              final MainNavigationScreenState? shell =
+                  MainNavigationScreen.maybeOf(context);
+              if (shell != null) {
+                shell.setTab(1);
+                return;
+              }
               Navigator.pushReplacement(
-        context,
-        MaterialPageRoute<void>(builder: (_) => const ExploreScreen()),
-      );
+                context,
+                MaterialPageRoute<void>(builder: (_) => const ExploreScreen()),
+              );
             },
             child: const Text("Explore Illustrations"),
           )

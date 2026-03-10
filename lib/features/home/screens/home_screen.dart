@@ -2,18 +2,15 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutterwork/core/utils/greeting_utils.dart';
-import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
 import 'package:flutterwork/core/widgets/image_card.dart';
 import 'package:flutterwork/features/explore/services/explore_catalog_service.dart';
 import 'package:flutterwork/features/explore/screens/explore_screen.dart';
-import 'package:flutterwork/features/gallery/screens/gallery_screen.dart';
 import 'package:flutterwork/features/home/widgets/categories_section.dart';
 import 'package:flutterwork/features/home/widgets/daily_challenge_card.dart';
 import 'package:flutterwork/features/home/widgets/featured_section.dart';
 import 'package:flutterwork/features/home/widgets/greeting_header.dart';
 import 'package:flutterwork/features/home/widgets/trending_section.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
-import 'package:flutterwork/features/profile/screens/profile_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -136,15 +133,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 ],
               ),
             ),
-          ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: AppBottomNavBar(activeIndex: 0, onTap: _onBottomNavTap),
-          ),
-        ],
-      ),
-    );
-  }
+	          ),
+	        ],
+	      ),
+	    );
+	  }
 
   Widget _buildLevelCard() {
     final double progress = (_xp / 1500).clamp(0, 1).toDouble();
@@ -252,29 +245,6 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Notifications are coming soon.')),
     );
-  }
-
-  void _onBottomNavTap(int index) {
-    if (index == 0) return;
-    if (index == 1) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute<void>(builder: (_) => const ExploreScreen()),
-      );
-    }
-    if (index == 2) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute<void>(builder: (_) => const GalleryScreen()),
-      );
-    }
-    if (index == 3) {
-    Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const ProfileScreen()),
-      );
-  }
-   
   }
 
   Future<void> _loadCategories() async {

@@ -27,6 +27,18 @@ class FloodFillRequest {
   });
 }
 
+class FillPercentageRequest {
+  final Uint8List currentRawRgba;
+  final Uint8List originalRawRgba;
+  final Uint8List borderMask;
+
+  const FillPercentageRequest({
+    required this.currentRawRgba,
+    required this.originalRawRgba,
+    required this.borderMask,
+  });
+}
+
 class PixelEngine {
   static const int _tolerance = 35;
   static const int _borderThreshold = 60;
@@ -227,6 +239,12 @@ class PixelEngine {
     return output;
   }
 
+  static Map<String, Object> processFloodFillToMap(FloodFillRequest request) {
+    final Uint8List result = processFloodFill(request);
+    final bool changed = !identical(result, request.rawRgbaBytes);
+    return <String, Object>{'raw': result, 'changed': changed};
+  }
+
   Uint8List exportImage() {
     if (!_isLoaded || _width == 0 || _height == 0 || _currentRawRgba.isEmpty) {
       return Uint8List(0);
@@ -239,38 +257,46 @@ class PixelEngine {
     return Uint8List.fromList(img.encodePng(image));
   }
 
-  double getFillPercentage(Uint8List currentRaw) {
+  static double computeFillPercentage(FillPercentageRequest request) {
+    final Uint8List currentRaw = request.currentRawRgba;
+    final Uint8List original = request.originalRawRgba;
+    final Uint8List borderMaskLocal = request.borderMask;
 
-  if (currentRaw.length != originalRawRgba.length) {
-    return 0.0;
-  }
-
-  final Uint8List original = originalRawRgba;
-  final Uint8List borderMaskLocal = borderMask;
-
-  int fillablePixels = 0;
-  int paintedPixels = 0;
-
-  for (int i = 0, bi = 0; i < borderMaskLocal.length; i++, bi += 4) {
-
-    if (borderMaskLocal[i] == 1) continue;
-
-    fillablePixels++;
-
-    final bool changed =
-        currentRaw[bi] != original[bi] ||
-        currentRaw[bi + 1] != original[bi + 1] ||
-        currentRaw[bi + 2] != original[bi + 2];
-
-    if (changed) {
-      paintedPixels++;
+    if (currentRaw.lengthInBytes != original.lengthInBytes) {
+      return 0.0;
     }
+    if (borderMaskLocal.isEmpty) return 0.0;
+
+    int fillablePixels = 0;
+    int paintedPixels = 0;
+
+    for (int i = 0, bi = 0; i < borderMaskLocal.length; i++, bi += 4) {
+      if (borderMaskLocal[i] == 1) continue;
+
+      fillablePixels++;
+
+      final bool changed = currentRaw[bi] != original[bi] ||
+          currentRaw[bi + 1] != original[bi + 1] ||
+          currentRaw[bi + 2] != original[bi + 2];
+
+      if (changed) {
+        paintedPixels++;
+      }
+    }
+
+    if (fillablePixels == 0) return 0.0;
+    return (paintedPixels / fillablePixels) * 100;
   }
 
-  if (fillablePixels == 0) return 0;
-
-  return (paintedPixels / fillablePixels) * 100;
-}
+  double getFillPercentage(Uint8List currentRaw) {
+    return computeFillPercentage(
+      FillPercentageRequest(
+        currentRawRgba: currentRaw,
+        originalRawRgba: originalRawRgba,
+        borderMask: borderMask,
+      ),
+    );
+  }
 
   Future<Uint8List?> getEncodedPng(
   Uint8List rgba,
@@ -278,9 +304,9 @@ class PixelEngine {
   int height,
 ) async {
 
-  final ui.ImmutableBuffer buffer =
-      await ui.ImmutableBuffer.fromUint8List(rgba);
-
+  final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+    rgba,
+  );
   final ui.ImageDescriptor descriptor = ui.ImageDescriptor.raw(
     buffer,
     width: width,
@@ -288,17 +314,22 @@ class PixelEngine {
     pixelFormat: ui.PixelFormat.rgba8888,
   );
 
-  final ui.Codec codec = await descriptor.instantiateCodec();
-  final ui.FrameInfo frame = await codec.getNextFrame();
+  ui.Codec? codec;
+  ui.Image? image;
+  try {
+    codec = await descriptor.instantiateCodec();
+    final ui.FrameInfo frame = await codec.getNextFrame();
+    image = frame.image;
 
-  final ui.Image image = frame.image;
-
-  final ByteData? pngBytes =
-      await image.toByteData(format: ui.ImageByteFormat.png);
-
-  if (pngBytes == null) return null;
-
-  return pngBytes.buffer.asUint8List();
+    final ByteData? pngBytes =
+        await image.toByteData(format: ui.ImageByteFormat.png);
+    return pngBytes?.buffer.asUint8List();
+  } finally {
+    image?.dispose();
+    codec?.dispose();
+    descriptor.dispose();
+    buffer.dispose();
+  }
 }
 
   Future<Uint8List> getPngBytes() async {
@@ -317,6 +348,7 @@ class PixelEngine {
     final ByteData? byteData = await image.toByteData(
       format: ui.ImageByteFormat.png,
     );
+    image.dispose();
     return byteData!.buffer.asUint8List();
   }
 }

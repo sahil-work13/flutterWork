@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutterwork/core/storage/coloring_book_session_storage.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
 import 'package:hive/hive.dart';
@@ -33,16 +33,20 @@ class GalleryController extends ChangeNotifier {
     loading = true;
     notifyListeners();
 
-    debugPrint(
-        "[GALLERY_DEBUG] Starting Load. Box: ${sessionNamespace}_metadata_box");
+    if (kDebugMode) {
+      debugPrint(
+        "[GALLERY_DEBUG] Starting Load. Box: ${sessionNamespace}_metadata_box",
+      );
+    }
 
     try {
       final Box<dynamic> metaBox =
           await ColoringBookSessionStorage.ensureMetaBox();
-      await metaBox.flush();
 
-      debugPrint("[GALLERY_DEBUG] Box Path: ${metaBox.path}");
-      debugPrint("[GALLERY_DEBUG] Total keys found: ${metaBox.length}");
+      if (kDebugMode) {
+        debugPrint("[GALLERY_DEBUG] Box Path: ${metaBox.path}");
+        debugPrint("[GALLERY_DEBUG] Total keys found: ${metaBox.length}");
+      }
 
       final Directory sessionDir =
           await ColoringBookSessionStorage.ensureSessionDirectory();
@@ -76,8 +80,11 @@ class GalleryController extends ChangeNotifier {
           progressPercent = rawProgress.toInt();
         }
 
-        debugPrint(
-            "[GALLERY_DEBUG] Key: $key | RawProgress: $rawProgress | Calculated: $progressPercent%");
+        if (kDebugMode) {
+          debugPrint(
+            "[GALLERY_DEBUG] Key: $key | RawProgress: $rawProgress | Calculated: $progressPercent%",
+          );
+        }
 
         /// Only show completed artworks
         if (progressPercent >= 90) {
@@ -107,7 +114,9 @@ class GalleryController extends ChangeNotifier {
       completedCount = items.length;
       totalHoursSpent = totalSeconds / 3600;
     } catch (e) {
-      debugPrint("[GALLERY_DEBUG] CRITICAL ERROR: $e");
+      if (kDebugMode) {
+        debugPrint("[GALLERY_DEBUG] CRITICAL ERROR: $e");
+      }
     } finally {
       loading = false;
       notifyListeners();

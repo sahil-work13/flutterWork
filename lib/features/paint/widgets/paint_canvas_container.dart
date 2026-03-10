@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'paint_loader.dart';
 
-class PaintCanvasContainer extends StatelessWidget {
+class PaintCanvasContainer extends StatefulWidget {
   const PaintCanvasContainer({
     super.key,
     required this.image,
@@ -31,6 +31,13 @@ class PaintCanvasContainer extends StatelessWidget {
   final void Function(Size size) onViewportSizeChanged;
 
   @override
+  State<PaintCanvasContainer> createState() => _PaintCanvasContainerState();
+}
+
+class _PaintCanvasContainerState extends State<PaintCanvasContainer> {
+  Size? _lastViewportSize;
+
+  @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 8, 18, 8),
@@ -39,8 +46,8 @@ class PaintCanvasContainer extends StatelessWidget {
           double canvasWidth = constraints.maxWidth;
           double canvasHeight = constraints.maxHeight;
 
-          if (imageWidth > 0 && imageHeight > 0) {
-            final double imageAspect = imageWidth / imageHeight;
+          if (widget.imageWidth > 0 && widget.imageHeight > 0) {
+            final double imageAspect = widget.imageWidth / widget.imageHeight;
             final double availableAspect =
                 constraints.maxWidth / constraints.maxHeight;
             if (availableAspect > imageAspect) {
@@ -52,7 +59,11 @@ class PaintCanvasContainer extends StatelessWidget {
             }
           }
 
-          onViewportSizeChanged(Size(canvasWidth, canvasHeight));
+          final Size viewportSize = Size(canvasWidth, canvasHeight);
+          if (_lastViewportSize != viewportSize) {
+            _lastViewportSize = viewportSize;
+            widget.onViewportSizeChanged(viewportSize);
+          }
 
           return Center(
             child: AnimatedContainer(
@@ -78,7 +89,7 @@ class PaintCanvasContainer extends StatelessWidget {
                   children: <Widget>[
                     _buildCanvasContent(canvasWidth, canvasHeight),
                     PaintImageTransitionLoader(
-                      visible: showImageTransitionLoader,
+                      visible: widget.showImageTransitionLoader,
                     ),
                   ],
                 ),
@@ -91,7 +102,7 @@ class PaintCanvasContainer extends StatelessWidget {
   }
 
   Widget _buildCanvasContent(double canvasWidth, double canvasHeight) {
-    if (image == null) {
+    if (widget.image == null) {
       return const Center(
         key: ValueKey<String>('paint_canvas_loader'),
         child: CircularProgressIndicator(),
@@ -99,13 +110,13 @@ class PaintCanvasContainer extends StatelessWidget {
     }
 
     return Listener(
-      key: ValueKey<int>(image.hashCode),
-      onPointerDown: onPointerDown,
-      onPointerMove: onPointerMove,
-      onPointerUp: onPointerUp,
-      onPointerCancel: onPointerCancel,
+      key: ValueKey<int>(widget.image.hashCode),
+      onPointerDown: widget.onPointerDown,
+      onPointerMove: widget.onPointerMove,
+      onPointerUp: widget.onPointerUp,
+      onPointerCancel: widget.onPointerCancel,
       child: InteractiveViewer(
-        transformationController: transformationController,
+        transformationController: widget.transformationController,
         panEnabled: true,
         minScale: 1.0,
         maxScale: 10.0,
@@ -113,7 +124,7 @@ class PaintCanvasContainer extends StatelessWidget {
           width: canvasWidth,
           height: canvasHeight,
           child: Center(
-            child: RawImage(image: image, fit: BoxFit.contain),
+            child: RawImage(image: widget.image, fit: BoxFit.contain),
           ),
         ),
       ),

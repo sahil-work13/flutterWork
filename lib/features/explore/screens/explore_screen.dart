@@ -1,14 +1,10 @@
 import 'package:flutter/material.dart';
-import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
 import 'package:flutterwork/features/explore/models/explore_item.dart';
 import 'package:flutterwork/features/explore/services/explore_catalog_service.dart';
 import 'package:flutterwork/features/explore/widgets/explore_category_chips.dart';
 import 'package:flutterwork/features/explore/widgets/explore_image_card.dart';
 import 'package:flutterwork/features/explore/widgets/explore_search_bar.dart';
-import 'package:flutterwork/features/gallery/screens/gallery_screen.dart';
-import 'package:flutterwork/features/home/screens/home_screen.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
-import 'package:flutterwork/features/profile/screens/profile_screen.dart';
 
 class ExploreScreen extends StatefulWidget {
   const ExploreScreen({super.key, this.initialCategory});
@@ -118,15 +114,11 @@ class _ExploreScreenState extends State<ExploreScreen> {
                 Expanded(child: _buildBodyContent(visibleItems)),
               ],
             ),
-          ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: AppBottomNavBar(activeIndex: 1, onTap: _onBottomNavTap),
-          ),
-        ],
-      ),
-    );
-  }
+	          ),
+	        ],
+	      ),
+	    );
+	  }
 
   Widget _buildBodyContent(List<ExploreItem> visibleItems) {
     if (_loading) {
@@ -228,29 +220,5 @@ class _ExploreScreenState extends State<ExploreScreen> {
         builder: (_) => BasicScreen(imagePath: imagePath),
       ),
     );
-  }
-
-  void _onBottomNavTap(int index) {
-    if (index == 1) return;
-    if (index == 0) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute<void>(builder: (_) => const HomeScreen()),
-      );
-      return;
-    }
-    if (index == 2) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute<void>(builder: (_) => const GalleryScreen()),
-      );
-    }
-    if (index == 3) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute<void>(builder: (_) => const ProfileScreen()),
-      );
-    }
-    
   }
 }

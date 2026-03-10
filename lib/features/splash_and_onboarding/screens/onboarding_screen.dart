@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutterwork/features/home/screens/home_screen.dart';
+import 'package:flutterwork/core/navigation/main_navigation_screen.dart';
 import 'package:flutterwork/features/splash_and_onboarding/widgets/onboarding_progress_dots.dart';
 import 'package:flutterwork/features/splash_and_onboarding/widgets/onboarding_slide_content.dart';
 
@@ -55,7 +55,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     Navigator.of(context).pushReplacement(
       PageRouteBuilder<void>(
         pageBuilder: (context, animation, secondaryAnimation) =>
-            const HomeScreen(),
+            const MainNavigationScreen(),
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
           return FadeTransition(opacity: animation, child: child);
         },

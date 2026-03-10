@@ -135,6 +135,7 @@ class _BasicScreenState extends State<BasicScreen> with WidgetsBindingObserver {
         if (_controller.showStartupLoader) {
           return Scaffold(
             backgroundColor: const Color(0xFF1A1A2E),
+            resizeToAvoidBottomInset: false, 
             body: const SafeArea(child: Center(child: PaintStartupLoader())),
           );
         }

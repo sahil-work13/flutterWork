@@ -1,78 +1,48 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
 import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
-import 'package:flutterwork/features/explore/screens/explore_screen.dart';
-import 'package:flutterwork/features/gallery/screens/gallery_screen.dart';
-import 'package:flutterwork/features/gallery/controllers/gallery_controller.dart';
-import 'package:flutterwork/features/home/screens/home_screen.dart';
-import 'package:flutterwork/features/profile/screens/profile_screen.dart';
+
+import 'main_navigation_controller.dart';
 
 class MainNavigationScreen extends StatefulWidget {
   const MainNavigationScreen({super.key, this.initialIndex = 0});
 
   final int initialIndex;
 
-  static MainNavigationScreenState? maybeOf(BuildContext context) {
-    return context.findAncestorStateOfType<MainNavigationScreenState>();
-  }
-
   @override
-  State<MainNavigationScreen> createState() => MainNavigationScreenState();
+  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
 }
 
-class MainNavigationScreenState extends State<MainNavigationScreen> {
-  late int _currentIndex;
-  late final List<Widget> _pages;
-  late final GalleryController _galleryController;
+class _MainNavigationScreenState extends State<MainNavigationScreen> {
+  late final MainNavigationController _controller;
 
   @override
   void initState() {
     super.initState();
-    _currentIndex = widget.initialIndex.clamp(0, 3);
-    _galleryController = GalleryController();
-    _pages = <Widget>[
-      const HomeScreen(),
-      const ExploreScreen(),
-      GalleryScreen(controller: _galleryController),
-      const ProfileScreen(),
-    ];
+    _controller = Get.isRegistered<MainNavigationController>()
+        ? Get.find<MainNavigationController>()
+        : Get.put<MainNavigationController>(
+            MainNavigationController(initialIndex: widget.initialIndex),
+            permanent: true,
+          );
+    _controller.setTab(widget.initialIndex);
   }
-
-  void setTab(int index) {
-    if (index < 0 || index >= _pages.length) return;
-    if (index == _currentIndex) return;
-    setState(() {
-      _currentIndex = index;
-    });
-
-    // Auto-refresh Gallery when the user navigates to the Gallery tab via the
-    // bottom navigation bar. This keeps the existing UI/flow while ensuring
-    // recently autosaved artwork appears reliably.
-    if (index == 2) {
-      unawaited(_galleryController.refreshOnTabVisible());
-    }
-  }
-
-  void _onNavTap(int index) => setTab(index);
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _pages,
+      body: Obx(
+        () => IndexedStack(
+          index: _controller.currentIndex.value,
+          children: _controller.pages,
+        ),
       ),
-      bottomNavigationBar: AppBottomNavBar(
-        activeIndex: _currentIndex,
-        onTap: _onNavTap,
+      bottomNavigationBar: Obx(
+        () => AppBottomNavBar(
+          activeIndex: _controller.currentIndex.value,
+          onTap: _controller.setTab,
+        ),
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _galleryController.dispose();
-    super.dispose();
   }
 }

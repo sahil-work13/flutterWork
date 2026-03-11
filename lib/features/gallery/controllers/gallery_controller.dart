@@ -2,22 +2,22 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:flutterwork/core/storage/coloring_book_session_storage.dart';
 import 'package:flutterwork/core/data/canvas_image_assets.dart';
+import 'package:get/get.dart';
 import 'package:hive/hive.dart';
 import 'dart:async';
 import 'dart:io';
 
-class GalleryController extends ChangeNotifier {
+class GalleryController extends GetxController {
   static const String sessionNamespace =
       ColoringBookSessionStorage.sessionNamespace;
   static const Duration _twoPhaseRefreshDelay = Duration(milliseconds: 650);
 
-  double totalHoursSpent = 0.0;
-  int completedCount = 0;
+  final RxDouble totalHoursSpent = 0.0.obs;
+  final RxInt completedCount = 0.obs;
 
-  List<Map<String, dynamic>> galleryItems = [];
+  final RxList<Map<String, dynamic>> galleryItems = <Map<String, dynamic>>[].obs;
 
-  bool loading = true;
-  bool _disposed = false;
+  final RxBool loading = true.obs;
   int _loadSeq = 0;
 
   String _getImageName(int imageId) {
@@ -59,7 +59,7 @@ class GalleryController extends ChangeNotifier {
 
   Future<void> _twoPhaseRefresh(int seq) async {
     await Future<void>.delayed(_twoPhaseRefreshDelay);
-    if (_disposed || seq != _loadSeq) return;
+    if (isClosed || seq != _loadSeq) return;
     await _loadGalleryInternal(seq: seq, showLoading: false, debugLogs: false);
   }
 
@@ -69,8 +69,7 @@ class GalleryController extends ChangeNotifier {
     required bool debugLogs,
   }) async {
     if (showLoading) {
-      loading = true;
-      notifyListeners();
+      loading.value = true;
     }
 
     if (debugLogs) {
@@ -169,21 +168,18 @@ class GalleryController extends ChangeNotifier {
         return bDate.compareTo(aDate);
       });
 
-      if (!_disposed && seq == _loadSeq) {
-        galleryItems = items;
-        completedCount = items.length;
-        totalHoursSpent = totalSeconds / 3600;
+      if (!isClosed && seq == _loadSeq) {
+        galleryItems.assignAll(items);
+        completedCount.value = items.length;
+        totalHoursSpent.value = totalSeconds / 3600;
       }
     } catch (e) {
       if (debugLogs) {
         debugPrint("[GALLERY_DEBUG] CRITICAL ERROR: $e");
       }
     } finally {
-      if (showLoading) {
-        loading = false;
-      }
-      if (!_disposed && seq == _loadSeq) {
-        notifyListeners();
+      if (showLoading && !isClosed && seq == _loadSeq) {
+        loading.value = false;
       }
     }
   }
@@ -211,7 +207,7 @@ class GalleryController extends ChangeNotifier {
   }
 
   String getFormattedTime() {
-	  final int totalSeconds = (totalHoursSpent * 3600).round();
+	  final int totalSeconds = (totalHoursSpent.value * 3600).round();
 
   if (totalSeconds < 60) {
     return "${totalSeconds}s";
@@ -229,10 +225,4 @@ class GalleryController extends ChangeNotifier {
 
 	  return "${hours}h ${minutes}m";
 	}
-
-  @override
-  void dispose() {
-    _disposed = true;
-    super.dispose();
-  }
 }

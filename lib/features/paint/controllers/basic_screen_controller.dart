@@ -14,7 +14,7 @@ import 'package:flutterwork/features/recording/controllers/paint_timelapse_contr
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 
-import '../../../engine/PixelEngine.dart';
+import '../../../engine/pixelEngine.dart';
 
 void _log(String tag, String msg) {
   if (kDebugMode) {

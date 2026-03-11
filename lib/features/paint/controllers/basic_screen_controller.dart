@@ -435,8 +435,9 @@ class BasicScreenController extends ChangeNotifier {
     try {
       final Uint8List? snapshot = _undoStack.removeLast();
       // Branch-aware timelapse: undo moves the timelapse pointer backwards.
-      // We do NOT record a new frame for undo itself; the next paint action
-      // will trim any "future" frames and continue from the new branch.
+      // We do NOT record a new frame for undo itself. If the user undoes all
+      // the way back to the original image, we reset the timelapse (and delete
+      // any persisted timelapse frames) so new fills start a fresh history.
       _timelapse.stepBackward();
       if (_fillCount > 0) {
         _fillCount--;
@@ -452,6 +453,14 @@ class BasicScreenController extends ChangeNotifier {
           _rawWidth,
           _rawHeight,
         );
+
+        // User is back at the original image: drop all previous timelapse
+        // history (including on-disk archived/tail frames) so the next fills
+        // record a new timelapse from scratch.
+        await _clearTimelapseArchiveForImage(_currentImageIndex);
+        await _clearTimelapseTailForImage(_currentImageIndex);
+        _timelapse.start();
+        _timelapse.recordFrame(originalRaw);
       } else {
         _rawFillBytes = snapshot;
         pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
@@ -1175,40 +1184,46 @@ class BasicScreenController extends ChangeNotifier {
           i,
         ).writeAsBytes(entry, flush: true);
       }
-      final _TimelapsePersistResult timelapsePersistResult =
-          await _persistTimelapseFrames(snapshot);
+	      final _TimelapsePersistResult timelapsePersistResult =
+	          await _persistTimelapseFrames(snapshot);
 
-      final DateTime now = DateTime.now();
-      double progress = 0;
+	      final DateTime now = DateTime.now();
+	      int progressPercent = 0;
 
-      if (snapshot.rawFillBytes != null) {
-        final int pixelCount = snapshot.rawWidth * snapshot.rawHeight;
-        if (pixelCount >= _progressScanIsolatePixelThreshold) {
-          progress = await compute<FillPercentageRequest, double>(
-            PixelEngine.computeFillPercentage,
-            FillPercentageRequest(
-              currentRawRgba: snapshot.rawFillBytes!,
-              originalRawRgba: pixelEngine.originalRawRgba,
-              borderMask: pixelEngine.borderMask,
-            ),
-          );
-        } else {
-          progress = pixelEngine.getFillPercentage(snapshot.rawFillBytes!);
-        }
-      }
-      final Map<String, dynamic> imageMeta = <String, dynamic>{
-        'version': 2,
-        'imageId': snapshot.imageIndex,
+	      if (snapshot.rawFillBytes != null) {
+	        final int pixelCount = snapshot.rawWidth * snapshot.rawHeight;
+	        if (pixelCount >= _progressScanIsolatePixelThreshold) {
+	          progressPercent = await compute<FillPercentageRequest, int>(
+	            PixelEngine.computeProgressPercent,
+	            FillPercentageRequest(
+	              currentRawRgba: snapshot.rawFillBytes!,
+	              originalRawRgba: pixelEngine.originalRawRgba,
+	              borderMask: pixelEngine.borderMask,
+	            ),
+	          );
+	        } else {
+	          progressPercent = PixelEngine.computeProgressPercent(
+	            FillPercentageRequest(
+	              currentRawRgba: snapshot.rawFillBytes!,
+	              originalRawRgba: pixelEngine.originalRawRgba,
+	              borderMask: pixelEngine.borderMask,
+	            ),
+	          );
+	        }
+	      }
+	      final Map<String, dynamic> imageMeta = <String, dynamic>{
+	        'version': 2,
+	        'imageId': snapshot.imageIndex,
         'fillCount': snapshot.fillCount,
         'totalTimeSeconds': snapshot.totalTimeSeconds,
-        'hasRawFill': snapshot.rawFillBytes != null,
-        'rawWidth': snapshot.rawWidth,
-        'rawHeight': snapshot.rawHeight,
-        'progressPercent': progress,
-        'undoKinds': undoKinds,
-        'timelapseFrameCount': timelapsePersistResult.totalFrameCount,
-        'timelapseArchiveFrameCount': timelapsePersistResult.archiveFrameCount,
-        'timelapseTailFrameCount': timelapsePersistResult.tailFrameCount,
+	        'hasRawFill': snapshot.rawFillBytes != null,
+	        'rawWidth': snapshot.rawWidth,
+	        'rawHeight': snapshot.rawHeight,
+	        'progressPercent': progressPercent.clamp(0, 100),
+	        'undoKinds': undoKinds,
+	        'timelapseFrameCount': timelapsePersistResult.totalFrameCount,
+	        'timelapseArchiveFrameCount': timelapsePersistResult.archiveFrameCount,
+	        'timelapseTailFrameCount': timelapsePersistResult.tailFrameCount,
         'undoStackPointer': snapshot.undoStack.isEmpty
             ? -1
             : snapshot.undoStack.length - 1,
@@ -1834,6 +1849,13 @@ class BasicScreenController extends ChangeNotifier {
     _timelapseArchivedFrameCountByImage[imageIndex] = 0;
   }
 
+  Future<void> _clearTimelapseTailForImage(int imageIndex) async {
+    final File tailFile = _imageTimelapseRawFile(imageIndex);
+    if (await tailFile.exists()) {
+      await tailFile.delete();
+    }
+  }
+
   /// Trims the archive file so it contains only the last [keepLastFrames] frames.
   /// Streams the tail portion to a temp file, then atomically renames it over
   /// the original. Returns the actual number of frames kept after trimming.
@@ -2083,25 +2105,12 @@ class BasicScreenController extends ChangeNotifier {
       return;
     }
 
-    int fillablePixels = 0;
-    int paintedPixels = 0;
-    for (int i = 0, bi = 0; i < pixelCount; i++, bi += 4) {
-      if (borderMask[i] == 1) continue;
-      fillablePixels++;
-      final bool changed =
-          currentRaw[bi] != originalRaw[bi] ||
-          currentRaw[bi + 1] != originalRaw[bi + 1] ||
-          currentRaw[bi + 2] != originalRaw[bi + 2];
-      if (changed) paintedPixels++;
-    }
-
-    if (fillablePixels == 0) {
-      _progressPercent = 0;
-      return;
-    }
-    _progressPercent = ((paintedPixels * 100) / fillablePixels).round().clamp(
-      0,
-      100,
+    _progressPercent = PixelEngine.computeProgressPercent(
+      FillPercentageRequest(
+        currentRawRgba: currentRaw,
+        originalRawRgba: originalRaw,
+        borderMask: borderMask,
+      ),
     );
   }
 

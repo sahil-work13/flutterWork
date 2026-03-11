@@ -71,14 +71,22 @@ class GalleryController extends ChangeNotifier {
 
         final dynamic rawProgress = meta['progressPercent'] ?? 0;
 
-        int progressPercent;
+        int progressPercent = 0;
 
-        /// Handle both 0.95 and 95 formats
-        if (rawProgress is double && rawProgress <= 1.0) {
-          progressPercent = (rawProgress * 100).toInt();
+        // Supports legacy persisted formats:
+        // - 0.95 (0..1 fraction)
+        // - 95.0 (double percent)
+        // - 95 (int percent)
+        if (rawProgress is int) {
+          progressPercent = rawProgress;
+        } else if (rawProgress is double) {
+          progressPercent = rawProgress <= 1.0
+              ? (rawProgress * 100).round()
+              : rawProgress.round();
         } else {
-          progressPercent = rawProgress.toInt();
+          progressPercent = int.tryParse(rawProgress.toString()) ?? 0;
         }
+        progressPercent = progressPercent.clamp(0, 100);
 
         if (kDebugMode) {
           debugPrint(

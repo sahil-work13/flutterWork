@@ -42,6 +42,7 @@ class FillPercentageRequest {
 class PixelEngine {
   static const int _tolerance = 35;
   static const int _borderThreshold = 60;
+  static const int _whiteThreshold = 245;
 
   bool _isLoaded = false;
   int _width = 0;
@@ -258,22 +259,46 @@ class PixelEngine {
   }
 
   static double computeFillPercentage(FillPercentageRequest request) {
+    // Backwards-compatible API returning a 0-100 percentage (double).
+    // Use [computeProgressPercent] when you need the exact UI percent.
+    return computeProgressPercent(request).toDouble();
+  }
+
+  /// Computes the exact integer progress percentage (0-100) used by the UI.
+  ///
+  /// This intentionally matches the progress logic used on-canvas so gallery
+  /// cards and saved metadata can show the same value.
+  static int computeProgressPercent(FillPercentageRequest request) {
     final Uint8List currentRaw = request.currentRawRgba;
     final Uint8List original = request.originalRawRgba;
     final Uint8List borderMaskLocal = request.borderMask;
 
     if (currentRaw.lengthInBytes != original.lengthInBytes) {
-      return 0.0;
+      return 0;
     }
-    if (borderMaskLocal.isEmpty) return 0.0;
+    if (borderMaskLocal.isEmpty) return 0;
 
     int fillablePixels = 0;
     int paintedPixels = 0;
+    int whiteFillablePixels = 0;
+    int unpaintedWhitePixels = 0;
 
     for (int i = 0, bi = 0; i < borderMaskLocal.length; i++, bi += 4) {
       if (borderMaskLocal[i] == 1) continue;
 
+      // Ignore transparent/non-opaque pixels (common for background areas in
+      // PNG assets). Counting these makes progress stick below 100% even when
+      // all visible regions have been filled.
+      if (original[bi + 3] != 255) continue;
       fillablePixels++;
+
+      final bool isOriginalWhiteish =
+          original[bi] >= _whiteThreshold &&
+          original[bi + 1] >= _whiteThreshold &&
+          original[bi + 2] >= _whiteThreshold;
+      if (isOriginalWhiteish) {
+        whiteFillablePixels++;
+      }
 
       final bool changed = currentRaw[bi] != original[bi] ||
           currentRaw[bi + 1] != original[bi + 1] ||
@@ -281,11 +306,27 @@ class PixelEngine {
 
       if (changed) {
         paintedPixels++;
+      } else if (isOriginalWhiteish) {
+        unpaintedWhitePixels++;
       }
     }
 
-    if (fillablePixels == 0) return 0.0;
-    return (paintedPixels / fillablePixels) * 100;
+    if (fillablePixels == 0) return 0;
+
+    int percent = ((paintedPixels * 100) / fillablePixels).round().clamp(0, 100);
+    if (whiteFillablePixels > 0 && percent >= 99) {
+      // Snap to 100% when only a tiny number of originally-white pixels remain.
+      int allowedRemainingWhitePixels = (whiteFillablePixels * 2) ~/ 1000; // 0.2%
+      if (allowedRemainingWhitePixels < 64) allowedRemainingWhitePixels = 64;
+      if (allowedRemainingWhitePixels > 4096) {
+        allowedRemainingWhitePixels = 4096;
+      }
+      if (unpaintedWhitePixels <= allowedRemainingWhitePixels) {
+        return 100;
+      }
+    }
+
+    return percent;
   }
 
   double getFillPercentage(Uint8List currentRaw) {

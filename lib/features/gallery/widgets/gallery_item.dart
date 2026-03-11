@@ -18,6 +18,7 @@ class GalleryItem extends StatelessWidget {
   Widget build(BuildContext context) {
     final int imageId = data["id"];
     final int progress = data["progress"] ?? 0;
+    final double progressValue = (progress.clamp(0, 100)) / 100.0;
     final String title = data["title"] ?? "Artwork ${imageId + 1}";
     final String? previewPath = data["previewPath"] as String?;
     final File? previewFile = previewPath == null ? null : File(previewPath);
@@ -145,11 +146,17 @@ class GalleryItem extends StatelessWidget {
 
                   Row(
                     children: [
-                      const Icon(Icons.auto_awesome,
-                          size: 10, color: Color(0xFF6C63FF)),
-                      const SizedBox(width: 4),
+                      const Text(
+                        'Progress',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: Color.fromRGBO(26, 26, 46, 0.6),
+                        ),
+                      ),
+                      const Spacer(),
                       Text(
-                        "$progress% Completed",
+                        "$progress% filled",
                         style: const TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
@@ -157,6 +164,21 @@ class GalleryItem extends StatelessWidget {
                         ),
                       ),
                     ],
+                  ),
+
+                  const SizedBox(height: 6),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: LinearProgressIndicator(
+                      minHeight: 6,
+                      value: progressValue,
+                      backgroundColor: const Color(
+                        0xFF6C63FF,
+                      ).withValues(alpha: 0.12),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        Color(0xFF6C63FF),
+                      ),
+                    ),
                   ),
                 ],
               ),

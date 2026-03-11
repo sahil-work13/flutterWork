@@ -8,18 +8,24 @@ import '../widgets/gallery_grid.dart';
 import '../widgets/empty_gallery.dart';
 
 class GalleryScreen extends StatefulWidget {
-  const GalleryScreen({super.key});
+  const GalleryScreen({super.key, this.controller});
+
+  final GalleryController? controller;
 
   @override
   State<GalleryScreen> createState() => _GalleryScreenState();
 }
 
 class _GalleryScreenState extends State<GalleryScreen> {
-  final GalleryController controller = GalleryController();
+  late final GalleryController controller;
+  late final bool _ownsController;
 
   @override
   void initState() {
     super.initState();
+    final GalleryController? injected = widget.controller;
+    _ownsController = injected == null;
+    controller = injected ?? GalleryController();
     controller.loadGallery();
   }
 
@@ -76,5 +82,13 @@ class _GalleryScreenState extends State<GalleryScreen> {
         },
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    if (_ownsController) {
+      controller.dispose();
+    }
+    super.dispose();
   }
 }

@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutterwork/core/widgets/app_bottom_nav_bar.dart';
 import 'package:flutterwork/features/explore/screens/explore_screen.dart';
 import 'package:flutterwork/features/gallery/screens/gallery_screen.dart';
+import 'package:flutterwork/features/gallery/controllers/gallery_controller.dart';
 import 'package:flutterwork/features/home/screens/home_screen.dart';
 import 'package:flutterwork/features/profile/screens/profile_screen.dart';
 
@@ -21,16 +24,18 @@ class MainNavigationScreen extends StatefulWidget {
 class MainNavigationScreenState extends State<MainNavigationScreen> {
   late int _currentIndex;
   late final List<Widget> _pages;
+  late final GalleryController _galleryController;
 
   @override
   void initState() {
     super.initState();
     _currentIndex = widget.initialIndex.clamp(0, 3);
-    _pages = const <Widget>[
-      HomeScreen(),
-      ExploreScreen(),
-      GalleryScreen(),
-      ProfileScreen(),
+    _galleryController = GalleryController();
+    _pages = <Widget>[
+      const HomeScreen(),
+      const ExploreScreen(),
+      GalleryScreen(controller: _galleryController),
+      const ProfileScreen(),
     ];
   }
 
@@ -40,6 +45,13 @@ class MainNavigationScreenState extends State<MainNavigationScreen> {
     setState(() {
       _currentIndex = index;
     });
+
+    // Auto-refresh Gallery when the user navigates to the Gallery tab via the
+    // bottom navigation bar. This keeps the existing UI/flow while ensuring
+    // recently autosaved artwork appears reliably.
+    if (index == 2) {
+      unawaited(_galleryController.refreshOnTabVisible());
+    }
   }
 
   void _onNavTap(int index) => setTab(index);
@@ -56,5 +68,11 @@ class MainNavigationScreenState extends State<MainNavigationScreen> {
         onTap: _onNavTap,
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    _galleryController.dispose();
+    super.dispose();
   }
 }

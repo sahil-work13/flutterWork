@@ -49,6 +49,7 @@ class ExploreCatalogService {
 
   static String _categoryFromFileName(String fileName) {
     final String lower = fileName.toLowerCase();
+    if (lower == 'test1') return 'Characters';
     if (lower.contains('mandala')) return 'Mandalas';
     if (lower.contains('onboarding') || lower.contains('splash')) {
       return 'Onboarding';
@@ -65,6 +66,7 @@ class ExploreCatalogService {
   static String _difficultyFor(String category, String fileName) {
     final String lower = fileName.toLowerCase();
     if (category == 'Mandalas') return 'Advanced';
+    if (lower == 'test1') return 'Intermediate';
     if (lower.contains('test')) return 'Beginner';
     if (lower.contains('smilie')) return 'Beginner';
     if (lower.contains('doremon') || lower.contains('shinchan')) {

@@ -97,14 +97,21 @@ class BasicScreenController extends ChangeNotifier {
   static const int _maxRemovalSteps = 50;
   static const int _minUndoSteps = _maxRemovalSteps;
   static const int _maxUndoStepsHard = _maxRemovalSteps;
+  static const int _minUndoStepsFloor = 1;
   static const int _undoBudgetBytes = 192 * 1024 * 1024;
   static const int _persistUndoBudgetBytes = 64 * 1024 * 1024;
   static const int _persistUndoHardLimit = _maxRemovalSteps;
   static const int _minTimelapseFrames = 24;
+  static const int _minTimelapseFramesFloor = 2;
   static const int _maxTimelapseFramesHard = 1800;
   static const int _timelapseBudgetBytes = 256 * 1024 * 1024;
   static const int _sessionRestoreUndoMaxEntries = _maxRemovalSteps;
   static const int _sessionRestoreTimelapseMaxFrames = 24;
+  static const int _maxCanvasUiDimension = 2048;
+  static const int _brushRadiusPixels = 14;
+  static const int _brushInterpolationMultiplier = 2;
+  static const int _fillRevealMaxFrames = 12;
+  static const Duration _fillRevealFrameDelay = Duration(milliseconds: 15);
 
   /// Maximum total frames returned to the timelapse player for playback.
   /// Caps the merged archive + tail list so RAM usage is bounded regardless
@@ -197,6 +204,17 @@ class BasicScreenController extends ChangeNotifier {
   final int _swipeMaxDurationMs = 450;
 
   bool _disposed = false;
+  bool _isBrushStrokeActive = false;
+  bool _brushStrokeChanged = false;
+  Uint8List? _brushStrokeRaw;
+  Uint8List? _brushUndoSnapshot;
+  int _brushRegionId = 0;
+  bool _brushUsesConnectivityMask = false;
+  Offset? _pendingBrushStartPosition;
+  int? _lastBrushPixelX;
+  int? _lastBrushPixelY;
+  bool _brushPreviewUpdateInFlight = false;
+  bool _brushPreviewNeedsAnotherFrame = false;
 
   final List<Color> _colorHistory = <Color>[
     const Color(0xFFF44336),
@@ -324,6 +342,11 @@ class BasicScreenController extends ChangeNotifier {
 
   void setActiveTool(PaintToolMode tool) {
     if (_activeTool == tool) return;
+    if (_isBrushStrokeActive) {
+      _finishBrushStroke();
+    } else {
+      _clearBrushConstraintState();
+    }
     _activeTool = tool;
     _notify();
   }
@@ -356,15 +379,42 @@ class BasicScreenController extends ChangeNotifier {
   void onPointerDown(PointerDownEvent event) {
     _activePointers++;
     if (_activePointers == 1) {
-      _pointerDownPosition = event.localPosition;
+      _pointerDownPosition = _activeTool == PaintToolMode.brush
+          ? null
+          : event.localPosition;
       _pointerDownTimeMs = DateTime.now().millisecondsSinceEpoch;
       _pointerDragged = false;
+      if (_activeTool == PaintToolMode.brush) {
+        _pendingBrushStartPosition = event.localPosition;
+      }
     } else {
+      if (_isBrushStrokeActive) {
+        _finishBrushStroke();
+      }
+      _pendingBrushStartPosition = null;
       _pointerDownPosition = null;
     }
   }
 
   void onPointerMove(PointerMoveEvent event) {
+    if (_activeTool == PaintToolMode.brush && _isBrushStrokeActive) {
+      _pointerDragged = true;
+      _extendBrushStroke(event.localPosition);
+      return;
+    }
+    if (_activeTool == PaintToolMode.brush &&
+        _activePointers == 1 &&
+        _pendingBrushStartPosition != null) {
+      if ((event.localPosition - _pendingBrushStartPosition!).distance > 1.5) {
+        _beginBrushStroke(_pendingBrushStartPosition!);
+        _pendingBrushStartPosition = null;
+        if (_isBrushStrokeActive) {
+          _pointerDragged = true;
+          _extendBrushStroke(event.localPosition);
+          return;
+        }
+      }
+    }
     if (_pointerDownPosition != null && !_pointerDragged) {
       if ((event.localPosition - _pointerDownPosition!).distance >
           _tapMoveThreshold) {
@@ -374,6 +424,33 @@ class BasicScreenController extends ChangeNotifier {
   }
 
   void onPointerUp(PointerUpEvent event) {
+    if (_activeTool == PaintToolMode.brush && _isBrushStrokeActive) {
+      _extendBrushStroke(event.localPosition);
+      _activePointers = (_activePointers - 1).clamp(0, 10);
+      _pendingBrushStartPosition = null;
+      _finishBrushStroke();
+      if (_activePointers == 0) {
+        _pointerDownPosition = null;
+        _pointerDragged = false;
+      }
+      return;
+    }
+    if (_activeTool == PaintToolMode.brush) {
+      _activePointers = (_activePointers - 1).clamp(0, 10);
+      final Offset? pendingStart = _pendingBrushStartPosition;
+      _pendingBrushStartPosition = null;
+      if (pendingStart != null && _activePointers == 0) {
+        _beginBrushStroke(pendingStart);
+        if (_isBrushStrokeActive) {
+          _finishBrushStroke();
+        }
+      }
+      if (_activePointers == 0) {
+        _pointerDownPosition = null;
+        _pointerDragged = false;
+      }
+      return;
+    }
     _activePointers = (_activePointers - 1).clamp(0, 10);
     if (_pointerDownPosition != null && _activePointers == 0) {
       final int elapsed =
@@ -399,14 +476,237 @@ class BasicScreenController extends ChangeNotifier {
 
   void onPointerCancel(PointerCancelEvent event) {
     _activePointers = (_activePointers - 1).clamp(0, 10);
+    if (_activeTool == PaintToolMode.brush && _isBrushStrokeActive) {
+      _finishBrushStroke();
+    }
+    _pendingBrushStartPosition = null;
     if (_activePointers == 0) {
       _pointerDownPosition = null;
       _pointerDragged = false;
     }
   }
 
+  void _beginBrushStroke(Offset localOffset) {
+    if (_uiImage == null || !_engineReady || _isProcessing) return;
+    final ({int x, int y, int index})? pixel = _pixelFromLocalOffset(localOffset);
+    if (pixel == null) return;
+    if (pixelEngine.borderMask[pixel.index] == 1) return;
+
+    _clearBrushConstraintState();
+    final int regionId = pixelEngine.regionIdAtPixelIndex(pixel.index);
+    if (regionId > 0) {
+      _brushRegionId = regionId;
+    } else if (pixelEngine.prepareConnectivityMask(pixel.index)) {
+      _brushUsesConnectivityMask = true;
+    } else {
+      return;
+    }
+
+    _isBrushStrokeActive = true;
+    _brushStrokeChanged = false;
+    _brushStrokeRaw = null;
+    _brushUndoSnapshot = _rawFillBytes;
+    _lastBrushPixelX = pixel.x;
+    _lastBrushPixelY = pixel.y;
+    _paintBrushSegment(pixel.x, pixel.y, pixel.x, pixel.y);
+  }
+
+  void _extendBrushStroke(Offset localOffset) {
+    if (!_isBrushStrokeActive) return;
+    final ({int x, int y, int index})? pixel = _pixelFromLocalOffset(localOffset);
+    if (pixel == null) return;
+
+    final int startX = _lastBrushPixelX ?? pixel.x;
+    final int startY = _lastBrushPixelY ?? pixel.y;
+    _lastBrushPixelX = pixel.x;
+    _lastBrushPixelY = pixel.y;
+    _paintBrushSegment(startX, startY, pixel.x, pixel.y);
+  }
+
+  void _finishBrushStroke() {
+    if (!_isBrushStrokeActive) return;
+    _isBrushStrokeActive = false;
+    _lastBrushPixelX = null;
+    _lastBrushPixelY = null;
+
+    final Uint8List? workingRaw = _brushStrokeRaw;
+    final Uint8List? undoSnapshot = _brushUndoSnapshot;
+    final bool didChange = _brushStrokeChanged && workingRaw != null;
+
+    _brushStrokeRaw = null;
+    _brushUndoSnapshot = null;
+    _brushStrokeChanged = false;
+    _clearBrushConstraintState();
+
+    if (!didChange) {
+      return;
+    }
+
+    _fillCount++;
+    _growUndoTargetForAction();
+    _pushUndoSnapshot(undoSnapshot);
+    _redoStack.clear();
+    _rawFillBytes = workingRaw;
+    pixelEngine.updateFromRawBytes(workingRaw, _rawWidth, _rawHeight);
+    final Uint8List? evictedFrame = _timelapse.recordFrame(workingRaw);
+    if (evictedFrame != null) {
+      _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
+    }
+    _recomputeProgressPercent();
+    _markColorRecent(_selectedColor, incrementUsage: true);
+    progressNotifier.value = _progressPercent;
+    colorNotifier.value = _selectedColor;
+    _notify();
+    _requestAutosave(immediate: true);
+
+    if (!_brushPreviewUpdateInFlight) {
+      _scheduleBrushPreviewRefresh(workingRaw);
+    }
+  }
+
+  ({int x, int y, int index})? _pixelFromLocalOffset(Offset localOffset) {
+    if (_cachedScaleFit <= 0 || _rawWidth <= 0 || _rawHeight <= 0) {
+      return null;
+    }
+    final Offset scene = transformationController.toScene(localOffset);
+    final int pixelX = ((scene.dx - _cachedFitOffsetX) / _cachedScaleFit).floor();
+    final int pixelY = ((scene.dy - _cachedFitOffsetY) / _cachedScaleFit).floor();
+    if (pixelX < 0 ||
+        pixelX >= _rawWidth ||
+        pixelY < 0 ||
+        pixelY >= _rawHeight) {
+      return null;
+    }
+    final int index = (pixelY * _rawWidth) + pixelX;
+    return (x: pixelX, y: pixelY, index: index);
+  }
+
+  Uint8List _ensureBrushWorkingRaw() {
+    return _brushStrokeRaw ??=
+        Uint8List.fromList(_rawFillBytes ?? pixelEngine.originalRawRgba);
+  }
+
+  void _clearBrushConstraintState() {
+    _brushRegionId = 0;
+    _pendingBrushStartPosition = null;
+    if (_brushUsesConnectivityMask) {
+      pixelEngine.clearConnectivityMask();
+      _brushUsesConnectivityMask = false;
+    }
+  }
+
+  void _paintBrushSegment(int startX, int startY, int endX, int endY) {
+    final int steps =
+        math.max((endX - startX).abs(), (endY - startY).abs()) *
+        _brushInterpolationMultiplier;
+    final int fillR = _to8Bit(_selectedColor.r);
+    final int fillG = _to8Bit(_selectedColor.g);
+    final int fillB = _to8Bit(_selectedColor.b);
+    bool changed = false;
+    for (int step = 0; step <= steps; step++) {
+      final double t = steps == 0 ? 0.0 : step / steps;
+      final int x = (startX + ((endX - startX) * t)).round();
+      final int y = (startY + ((endY - startY) * t)).round();
+      if (_paintBrushCircle(x, y, fillR, fillG, fillB)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      _brushStrokeChanged = true;
+      _scheduleBrushPreviewRefresh(_brushStrokeRaw!);
+    }
+  }
+
+  bool _paintBrushCircle(
+    int centerX,
+    int centerY,
+    int fillR,
+    int fillG,
+    int fillB,
+  ) {
+    bool changed = false;
+    Uint8List? raw;
+    final int radius = _brushRadiusPixels;
+    final int radiusSquared = radius * radius;
+    for (int dy = -radius; dy <= radius; dy++) {
+      final int y = centerY + dy;
+      if (y < 0 || y >= _rawHeight) continue;
+      for (int dx = -radius; dx <= radius; dx++) {
+        if ((dx * dx) + (dy * dy) > radiusSquared) continue;
+        final int x = centerX + dx;
+        if (x < 0 || x >= _rawWidth) continue;
+        final int pixelIndex = (y * _rawWidth) + x;
+        if (pixelEngine.borderMask[pixelIndex] == 1) continue;
+        if (_brushRegionId > 0 &&
+            pixelEngine.regionIdAtPixelIndex(pixelIndex) != _brushRegionId) {
+          continue;
+        }
+        if (_brushUsesConnectivityMask &&
+            !pixelEngine.connectivityMaskContains(pixelIndex)) {
+          continue;
+        }
+
+        raw ??= _ensureBrushWorkingRaw();
+        final int byteBase = pixelIndex << 2;
+        if (raw[byteBase] == fillR &&
+            raw[byteBase + 1] == fillG &&
+            raw[byteBase + 2] == fillB &&
+            raw[byteBase + 3] == 255) {
+          continue;
+        }
+        raw[byteBase] = fillR;
+        raw[byteBase + 1] = fillG;
+        raw[byteBase + 2] = fillB;
+        raw[byteBase + 3] = 255;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  void _scheduleBrushPreviewRefresh(Uint8List raw) {
+    if (_disposed || _rawWidth <= 0 || _rawHeight <= 0) return;
+    if (_brushPreviewUpdateInFlight) {
+      _brushPreviewNeedsAnotherFrame = true;
+      return;
+    }
+    _brushPreviewUpdateInFlight = true;
+    _brushPreviewNeedsAnotherFrame = false;
+    unawaited(
+      _rawRgbaToUiImage(raw, _rawWidth, _rawHeight)
+          .then((ui.Image image) {
+            if (_disposed) {
+              image.dispose();
+              return;
+            }
+            final bool isStillRelevant =
+                identical(_brushStrokeRaw, raw) || identical(_rawFillBytes, raw);
+            if (!isStillRelevant) {
+              image.dispose();
+              return;
+            }
+            _replaceUiImage(image);
+            _notify();
+          })
+          .catchError((Object e) {
+            _log('BRUSH_PREVIEW', 'ERROR: $e');
+          })
+          .whenComplete(() {
+            _brushPreviewUpdateInFlight = false;
+            if (_brushPreviewNeedsAnotherFrame && _brushStrokeRaw != null) {
+              _scheduleBrushPreviewRefresh(_brushStrokeRaw!);
+            }
+          }),
+    );
+  }
+
   void changeImage(int delta) {
     if (delta == 0) return;
+    if (_isBrushStrokeActive) {
+      _finishBrushStroke();
+    } else {
+      _clearBrushConstraintState();
+    }
     if (_isImageLoading) {
       _queuedImageDelta += delta;
       return;
@@ -423,7 +723,7 @@ class BasicScreenController extends ChangeNotifier {
     if (_undoStack.isEmpty) {
       if (_fillCount > 0) {
         _showTemporaryMessage(
-          'Use Eraser. You have reached the 50-removal limit.',
+          'Use Eraser. Undo history limit reached for this image.',
         );
       }
       return;
@@ -434,6 +734,7 @@ class BasicScreenController extends ChangeNotifier {
     _notify();
     try {
       final Uint8List? snapshot = _undoStack.removeLast();
+      final Uint8List currentRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
       // Branch-aware timelapse: undo moves the timelapse pointer backwards.
       // We do NOT record a new frame for undo itself. If the user undoes all
       // the way back to the original image, we reset the timelapse (and delete
@@ -446,13 +747,20 @@ class BasicScreenController extends ChangeNotifier {
       ui.Image restoredImage;
       if (snapshot == null) {
         final Uint8List originalRaw = pixelEngine.originalRawRgba;
+        final bool animated = await _animatePixelTransition(
+          fromRaw: currentRaw,
+          toRaw: originalRaw,
+          reverseBuckets: true,
+        );
         _rawFillBytes = null;
         pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
-        restoredImage = await _rawRgbaToUiImage(
-          originalRaw,
-          _rawWidth,
-          _rawHeight,
-        );
+        restoredImage = animated
+            ? _uiImage!
+            : await _rawRgbaToUiImage(
+                originalRaw,
+                _rawWidth,
+                _rawHeight,
+              );
 
         // User is back at the original image: drop all previous timelapse
         // history (including on-disk archived/tail frames) so the next fills
@@ -462,13 +770,20 @@ class BasicScreenController extends ChangeNotifier {
         _timelapse.start();
         _timelapse.recordFrame(originalRaw);
       } else {
+        final bool animated = await _animatePixelTransition(
+          fromRaw: currentRaw,
+          toRaw: snapshot,
+          reverseBuckets: true,
+        );
         _rawFillBytes = snapshot;
         pixelEngine.updateFromRawBytes(snapshot, _rawWidth, _rawHeight);
-        restoredImage = await _rawRgbaToUiImage(
-          snapshot,
-          _rawWidth,
-          _rawHeight,
-        );
+        restoredImage = animated
+            ? _uiImage!
+            : await _rawRgbaToUiImage(
+                snapshot,
+                _rawWidth,
+                _rawHeight,
+              );
       }
       _recomputeProgressPercent();
 
@@ -571,10 +886,14 @@ class BasicScreenController extends ChangeNotifier {
 
       try {
         final Uint8List baseRaw = _rawFillBytes ?? pixelEngine.originalRawRgba;
+        final Uint8List originalRaw = pixelEngine.originalRawRgba;
 
       final FloodFillRequest request = FloodFillRequest(
           rawRgbaBytes: baseRaw,
           borderMask: pixelEngine.borderMask,
+          replacementRawRgba: _activeTool == PaintToolMode.eraser
+              ? originalRaw
+              : null,
           x: pixelX,
           y: pixelY,
           width: _rawWidth,
@@ -617,23 +936,35 @@ class BasicScreenController extends ChangeNotifier {
         return;
       }
 
-      _fillCount++;
-      _growUndoTargetForAction();
-      _pushUndoSnapshot(_rawFillBytes);
-      _redoStack.clear();
-      _rawFillBytes = rawResult;
-      pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
-      final Uint8List? evictedFrame = _timelapse.recordFrame(_rawFillBytes!);
-      if (evictedFrame != null) {
-        _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
-      }
-      _recomputeProgressPercent();
-      if (didChangePixels && _activeTool != PaintToolMode.eraser) {
-        _markColorRecent(_selectedColor, incrementUsage: true);
+      final Uint32List? changedPixelsHint = _activeTool == PaintToolMode.fill
+          ? pixelEngine.regionPixelsAtPixelIndex(pixelIndex)
+          : null;
+      final bool animated = _activeTool == PaintToolMode.fill
+          ? await _animatePixelTransition(
+              fromRaw: baseRaw,
+              toRaw: rawResult,
+              startPixelIndex: pixelIndex,
+              changedPixelsHint: changedPixelsHint,
+            )
+          : false;
+      final Uint8List committedRaw = await _commitTapResult(
+        rawResult: rawResult,
+        originalRaw: originalRaw,
+        didChangePixels: didChangePixels,
+      );
+
+      if (animated) {
+        _isProcessing = false;
+        processingNotifier.value = false;
+        progressNotifier.value = _progressPercent;
+        colorNotifier.value = _selectedColor;
+        _notify();
+        _requestAutosave(immediate: true);
+        return;
       }
 
       final ui.Image newUiImage = await _rawRgbaToUiImage(
-        rawResult,
+        committedRaw,
         _rawWidth,
         _rawHeight,
       );
@@ -657,16 +988,316 @@ class BasicScreenController extends ChangeNotifier {
     }
   }
 
+  Future<Uint8List> _commitTapResult({
+    required Uint8List rawResult,
+    required Uint8List originalRaw,
+    required bool didChangePixels,
+  }) async {
+    _fillCount++;
+    _growUndoTargetForAction();
+    _pushUndoSnapshot(_rawFillBytes);
+    _redoStack.clear();
+
+    final bool erasedBackToOriginal =
+        _activeTool == PaintToolMode.eraser && _rawEquals(rawResult, originalRaw);
+    final Uint8List committedRaw = erasedBackToOriginal ? originalRaw : rawResult;
+    if (erasedBackToOriginal) {
+      _rawFillBytes = null;
+      pixelEngine.updateFromRawBytes(originalRaw, _rawWidth, _rawHeight);
+      await _clearTimelapseArchiveForImage(_currentImageIndex);
+      await _clearTimelapseTailForImage(_currentImageIndex);
+      _timelapse.start();
+      _timelapse.recordFrame(originalRaw);
+    } else {
+      _rawFillBytes = rawResult;
+      pixelEngine.updateFromRawBytes(rawResult, _rawWidth, _rawHeight);
+      final Uint8List? evictedFrame = _timelapse.recordFrame(_rawFillBytes!);
+      if (evictedFrame != null) {
+        _enqueueTimelapseArchivedFrame(_currentImageIndex, evictedFrame);
+      }
+    }
+    _recomputeProgressPercent();
+    if (didChangePixels && _activeTool != PaintToolMode.eraser) {
+      _markColorRecent(_selectedColor, incrementUsage: true);
+    }
+    return committedRaw;
+  }
+
+  Future<bool> _animatePixelTransition({
+    required Uint8List fromRaw,
+    required Uint8List toRaw,
+    int? startPixelIndex,
+    List<int>? changedPixelsHint,
+    bool reverseBuckets = false,
+  }) async {
+    final List<List<int>> buckets =
+        changedPixelsHint != null && changedPixelsHint.isNotEmpty
+        ? _buildRevealBucketsFromChangedPixels(
+            changedPixelsHint,
+            baseRaw: fromRaw,
+            filledRaw: toRaw,
+            startPixelIndex: startPixelIndex,
+          )
+        : _buildFillRevealBuckets(
+            baseRaw: fromRaw,
+            filledRaw: toRaw,
+            startPixelIndex: startPixelIndex,
+          );
+    if (buckets.isEmpty) {
+      return false;
+    }
+
+    final Uint8List animatedRaw = Uint8List.fromList(fromRaw);
+    final List<List<int>> orderedBuckets = reverseBuckets
+        ? buckets.reversed.toList(growable: false)
+        : buckets;
+    final int totalBuckets = orderedBuckets.length;
+    for (int bucketIndex = 0; bucketIndex < totalBuckets; bucketIndex++) {
+      final List<int> bucket = orderedBuckets[bucketIndex];
+      if (bucket.isEmpty) {
+        continue;
+      }
+
+      for (final int pixelIndex in bucket) {
+        final int byteBase = pixelIndex << 2;
+        animatedRaw[byteBase] = toRaw[byteBase];
+        animatedRaw[byteBase + 1] = toRaw[byteBase + 1];
+        animatedRaw[byteBase + 2] = toRaw[byteBase + 2];
+        animatedRaw[byteBase + 3] = toRaw[byteBase + 3];
+      }
+
+      final ui.Image frameImage = await _rawRgbaToUiImage(
+        animatedRaw,
+        _rawWidth,
+        _rawHeight,
+      );
+      if (_disposed) {
+        frameImage.dispose();
+        return false;
+      }
+
+      _replaceUiImage(frameImage);
+      _notify();
+
+      if (bucketIndex + 1 < totalBuckets) {
+        await Future<void>.delayed(_fillRevealFrameDelay);
+      }
+    }
+    return true;
+  }
+
+  List<List<int>> _buildRevealBucketsFromChangedPixels(
+    List<int> changedPixels, {
+    required Uint8List baseRaw,
+    required Uint8List filledRaw,
+    required int? startPixelIndex,
+  }) {
+    final int pixelCount = _rawWidth * _rawHeight;
+    if (pixelCount <= 0 ||
+        changedPixels.isEmpty ||
+        baseRaw.lengthInBytes < pixelCount * 4 ||
+        filledRaw.lengthInBytes < pixelCount * 4 ||
+        (startPixelIndex != null &&
+            (startPixelIndex < 0 || startPixelIndex >= pixelCount))) {
+      return const <List<int>>[];
+    }
+
+    final List<int> effectiveChangedPixels = <int>[];
+    int sumX = 0;
+    int sumY = 0;
+    int maxDistanceSquared = 0;
+    for (final int pixelIndex in changedPixels) {
+      final int byteBase = pixelIndex << 2;
+      final bool changed = baseRaw[byteBase] != filledRaw[byteBase] ||
+          baseRaw[byteBase + 1] != filledRaw[byteBase + 1] ||
+          baseRaw[byteBase + 2] != filledRaw[byteBase + 2] ||
+          baseRaw[byteBase + 3] != filledRaw[byteBase + 3];
+      if (!changed) {
+        continue;
+      }
+
+      effectiveChangedPixels.add(pixelIndex);
+      final int pixelX = pixelIndex % _rawWidth;
+      final int pixelY = pixelIndex ~/ _rawWidth;
+      sumX += pixelX;
+      sumY += pixelY;
+      if (startPixelIndex != null) {
+        final int dx = pixelX - (startPixelIndex % _rawWidth);
+        final int dy = pixelY - (startPixelIndex ~/ _rawWidth);
+        final int distanceSquared = (dx * dx) + (dy * dy);
+        if (distanceSquared > maxDistanceSquared) {
+          maxDistanceSquared = distanceSquared;
+        }
+      }
+    }
+
+    if (effectiveChangedPixels.isEmpty) {
+      return const <List<int>>[];
+    }
+
+    final int resolvedStartPixelIndex = startPixelIndex ??
+        ((((sumY / effectiveChangedPixels.length).round().clamp(
+                      0,
+                      _rawHeight - 1,
+                    ))
+                    * _rawWidth) +
+                ((sumX / effectiveChangedPixels.length).round().clamp(
+                      0,
+                      _rawWidth - 1,
+                    )));
+    final int startX = resolvedStartPixelIndex % _rawWidth;
+    final int startY = resolvedStartPixelIndex ~/ _rawWidth;
+    if (startPixelIndex == null) {
+      for (final int pixelIndex in effectiveChangedPixels) {
+        final int dx = (pixelIndex % _rawWidth) - startX;
+        final int dy = (pixelIndex ~/ _rawWidth) - startY;
+        final int distanceSquared = (dx * dx) + (dy * dy);
+        if (distanceSquared > maxDistanceSquared) {
+          maxDistanceSquared = distanceSquared;
+        }
+      }
+    }
+
+    final int bucketCount = _resolveFillRevealFrameCount(
+      effectiveChangedPixels.length,
+    );
+    final List<List<int>> buckets = List<List<int>>.generate(
+      bucketCount,
+      (_) => <int>[],
+    );
+    if (maxDistanceSquared == 0) {
+      buckets[0].addAll(effectiveChangedPixels);
+      return buckets;
+    }
+
+    for (final int pixelIndex in effectiveChangedPixels) {
+      final int dx = (pixelIndex % _rawWidth) - startX;
+      final int dy = (pixelIndex ~/ _rawWidth) - startY;
+      final int distanceSquared = (dx * dx) + (dy * dy);
+      final int bucketIndex =
+          ((distanceSquared * (bucketCount - 1)) / maxDistanceSquared).floor();
+      buckets[bucketIndex].add(pixelIndex);
+    }
+
+    return buckets.where((List<int> bucket) => bucket.isNotEmpty).toList();
+  }
+
+  List<List<int>> _buildFillRevealBuckets({
+    required Uint8List baseRaw,
+    required Uint8List filledRaw,
+    required int? startPixelIndex,
+  }) {
+    final int pixelCount = _rawWidth * _rawHeight;
+    if (pixelCount <= 0 ||
+        baseRaw.lengthInBytes < pixelCount * 4 ||
+        filledRaw.lengthInBytes < pixelCount * 4 ||
+        (startPixelIndex != null &&
+            (startPixelIndex < 0 || startPixelIndex >= pixelCount))) {
+      return const <List<int>>[];
+    }
+    final List<int> changedPixels = <int>[];
+    int sumX = 0;
+    int sumY = 0;
+    int maxDistanceSquared = 0;
+
+    for (int pixelIndex = 0, byteBase = 0;
+        pixelIndex < pixelCount;
+        pixelIndex++, byteBase += 4) {
+      final bool changed = baseRaw[byteBase] != filledRaw[byteBase] ||
+          baseRaw[byteBase + 1] != filledRaw[byteBase + 1] ||
+          baseRaw[byteBase + 2] != filledRaw[byteBase + 2] ||
+          baseRaw[byteBase + 3] != filledRaw[byteBase + 3];
+      if (!changed) {
+        continue;
+      }
+
+      changedPixels.add(pixelIndex);
+      final int pixelX = pixelIndex % _rawWidth;
+      final int pixelY = pixelIndex ~/ _rawWidth;
+      sumX += pixelX;
+      sumY += pixelY;
+      if (startPixelIndex != null) {
+        final int dx = pixelX - (startPixelIndex % _rawWidth);
+        final int dy = pixelY - (startPixelIndex ~/ _rawWidth);
+        final int distanceSquared = (dx * dx) + (dy * dy);
+        if (distanceSquared > maxDistanceSquared) {
+          maxDistanceSquared = distanceSquared;
+        }
+      }
+    }
+
+    if (changedPixels.isEmpty) {
+      return const <List<int>>[];
+    }
+
+    final int resolvedStartPixelIndex = startPixelIndex ??
+        ((((sumY / changedPixels.length).round().clamp(0, _rawHeight - 1))
+                    * _rawWidth) +
+                ((sumX / changedPixels.length).round().clamp(0, _rawWidth - 1)));
+    final int startX = resolvedStartPixelIndex % _rawWidth;
+    final int startY = resolvedStartPixelIndex ~/ _rawWidth;
+    if (startPixelIndex == null) {
+      for (final int pixelIndex in changedPixels) {
+        final int dx = (pixelIndex % _rawWidth) - startX;
+        final int dy = (pixelIndex ~/ _rawWidth) - startY;
+        final int distanceSquared = (dx * dx) + (dy * dy);
+        if (distanceSquared > maxDistanceSquared) {
+          maxDistanceSquared = distanceSquared;
+        }
+      }
+    }
+
+    final int bucketCount = _resolveFillRevealFrameCount(changedPixels.length);
+    final List<List<int>> buckets = List<List<int>>.generate(
+      bucketCount,
+      (_) => <int>[],
+    );
+
+    if (maxDistanceSquared == 0) {
+      buckets[0].addAll(changedPixels);
+      return buckets;
+    }
+
+    for (final int pixelIndex in changedPixels) {
+      final int dx = (pixelIndex % _rawWidth) - startX;
+      final int dy = (pixelIndex ~/ _rawWidth) - startY;
+      final int distanceSquared = (dx * dx) + (dy * dy);
+      final int bucketIndex =
+          ((distanceSquared * (bucketCount - 1)) / maxDistanceSquared).floor();
+      buckets[bucketIndex].add(pixelIndex);
+    }
+
+    return buckets.where((List<int> bucket) => bucket.isNotEmpty).toList();
+  }
+
+  int _resolveFillRevealFrameCount(int changedPixelCount) {
+    if (changedPixelCount <= 64) return 4;
+    if (changedPixelCount <= 512) return 6;
+    if (changedPixelCount <= 4000) return 8;
+    if (changedPixelCount <= 24000) return 10;
+    return _fillRevealMaxFrames;
+  }
+
   Future<void> loadImage({bool restoreSavedState = true}) async {
     final Stopwatch loadPerfWatch = Stopwatch()..start();
     final int loadSeq = ++_imageLoadSeq;
     final int imageIndexAtLoad = _currentImageIndex;
     final String assetPathAtLoad = _testImages[imageIndexAtLoad];
-    ui.Image? preview;
+    Future<({ui.Image image, int rawWidth, int rawHeight})>? previewFuture;
+    bool previewOwnedByCanvas = false;
+    final bool decodePreviewInParallel = _shouldDecodePreviewInParallel(
+      restoreSavedState,
+      imageIndexAtLoad,
+    );
     _log(
       'LOAD_PERF',
       'START seq=$loadSeq image=$imageIndexAtLoad restore=$restoreSavedState asset=$assetPathAtLoad',
     );
+    if (_isBrushStrokeActive) {
+      _finishBrushStroke();
+    } else {
+      _clearBrushConstraintState();
+    }
     unawaited(_clearUndoArchiveForImage(imageIndexAtLoad));
     _isImageLoading = true;
     _engineReady = false;
@@ -683,30 +1314,19 @@ class BasicScreenController extends ChangeNotifier {
         'asset_read bytes=${bytes.lengthInBytes} elapsed=${loadPerfWatch.elapsedMilliseconds}ms',
       );
 
-      preview = await _decodeToUiImage(bytes);
-      if (_disposed || loadSeq != _imageLoadSeq) {
-        preview.dispose();
-        preview = null;
-        return;
+      if (decodePreviewInParallel) {
+        previewFuture = _decodePreviewImage(bytes);
       }
-      _log(
-        'LOAD_PERF',
-        'preview_decoded size=${preview.width}x${preview.height} elapsed=${loadPerfWatch.elapsedMilliseconds}ms',
-      );
-
-      _rawWidth = preview.width;
-      _rawHeight = preview.height;
-      transformationController.value = Matrix4.identity();
-      _updateFitCache();
 
       await Future<void>.delayed(Duration.zero);
       if (_disposed || loadSeq != _imageLoadSeq) return;
 
-      final Map<String, Object> prepared = await _loadOrPrepareImageData(
+      final Future<Map<String, Object>> preparedFuture = _loadOrPrepareImageData(
         imageIndexAtLoad,
         assetPathAtLoad,
         bytes,
       );
+      final Map<String, Object> prepared = await preparedFuture;
       if (_disposed || loadSeq != _imageLoadSeq) return;
       _log(
         'LOAD_PERF',
@@ -748,12 +1368,30 @@ class BasicScreenController extends ChangeNotifier {
         _timelapseArchivedFrameCountByImage[_currentImageIndex] = 0;
       }
 
-      final ui.Image nextImage = loaded ?? preview;
-      if (loaded == null) {
-        preview = null;
+      late final ui.Image nextImage;
+      if (loaded != null) {
+        nextImage = loaded;
+        if (previewFuture != null) {
+          unawaited(
+            previewFuture.then((decoded) {
+              decoded.image.dispose();
+            }).catchError((Object _) {}),
+          );
+        }
       } else {
-        preview.dispose();
-        preview = null;
+        previewFuture ??= _decodePreviewImage(bytes);
+        final ({ui.Image image, int rawWidth, int rawHeight}) previewDecode =
+            await previewFuture;
+        if (_disposed || loadSeq != _imageLoadSeq) {
+          previewDecode.image.dispose();
+          return;
+        }
+        _log(
+          'LOAD_PERF',
+          'preview_decoded size=${previewDecode.image.width}x${previewDecode.image.height} elapsed=${loadPerfWatch.elapsedMilliseconds}ms',
+        );
+        nextImage = previewDecode.image;
+        previewOwnedByCanvas = true;
       }
       _replaceUiImage(nextImage);
       transformationController.value = Matrix4.identity();
@@ -797,8 +1435,14 @@ class BasicScreenController extends ChangeNotifier {
         processingNotifier.value = false;
         _notify();
       }
+      if (previewFuture != null && !previewOwnedByCanvas) {
+        unawaited(
+          previewFuture.then((decoded) {
+            decoded.image.dispose();
+          }).catchError((Object _) {}),
+        );
+      }
     } finally {
-      preview?.dispose();
       if (loadSeq == _imageLoadSeq) {
         _isImageLoading = false;
         if (_disposed) {
@@ -970,8 +1614,10 @@ class BasicScreenController extends ChangeNotifier {
         return;
       }
 
-      await _preparedRawFile(imageIndex).writeAsBytes(raw, flush: true);
-      await _preparedMaskFile(imageIndex).writeAsBytes(borderMask, flush: true);
+      await Future.wait<File>(<Future<File>>[
+        _preparedRawFile(imageIndex).writeAsBytes(raw, flush: false),
+        _preparedMaskFile(imageIndex).writeAsBytes(borderMask, flush: false),
+      ]);
       await _sessionMetaBox!
           .put(_preparedMetaKey(imageIndex), <String, dynamic>{
             'version': 1,
@@ -1620,12 +2266,24 @@ class BasicScreenController extends ChangeNotifier {
     return null;
   }
 
-  Future<File?> exportCurrentImagePng() async {
-    final ui.Image? image = _uiImage;
-    if (image == null) return null;
+  bool _shouldDecodePreviewInParallel(bool restoreSavedState, int imageIndex) {
+    if (!restoreSavedState || !_storageReady || _sessionMetaBox == null) {
+      return true;
+    }
+    final dynamic rawMeta = _sessionMetaBox!.get(_imageMetaKey(imageIndex));
+    if (rawMeta is! Map) {
+      return true;
+    }
+    return rawMeta['hasRawFill'] != true;
+  }
 
-    final ByteData? pngData = await image.toByteData(
-      format: ui.ImageByteFormat.png,
+  Future<File?> exportCurrentImagePng() async {
+    final Uint8List raw = _rawFillBytes ?? pixelEngine.originalRawRgba;
+    if (raw.isEmpty || _rawWidth <= 0 || _rawHeight <= 0) return null;
+    final Uint8List? pngData = await pixelEngine.getEncodedPng(
+      raw,
+      _rawWidth,
+      _rawHeight,
     );
     if (pngData == null) return null;
 
@@ -1633,7 +2291,7 @@ class BasicScreenController extends ChangeNotifier {
     final File output = File(
       '${tempDir.path}${Platform.pathSeparator}color_fill_${DateTime.now().millisecondsSinceEpoch}.png',
     );
-    await output.writeAsBytes(pngData.buffer.asUint8List(), flush: true);
+    await output.writeAsBytes(pngData, flush: true);
     return output;
   }
 
@@ -1724,25 +2382,25 @@ class BasicScreenController extends ChangeNotifier {
   int _runtimeUndoLimit() {
     final int frameBytes = _rawWidth * _rawHeight * 4;
     if (frameBytes <= 0) {
-      return _targetUndoSteps.clamp(_minUndoSteps, _maxUndoStepsHard);
+      return _targetUndoSteps.clamp(_minUndoStepsFloor, _maxUndoStepsHard);
     }
     final int memoryCap = (_undoBudgetBytes ~/ frameBytes).clamp(
-      _minUndoSteps,
+      _minUndoStepsFloor,
       _maxUndoStepsHard,
     );
     if (_targetUndoSteps > memoryCap) {
       _targetUndoSteps = memoryCap;
     }
-    return _targetUndoSteps.clamp(_minUndoSteps, memoryCap);
+    return _targetUndoSteps.clamp(_minUndoStepsFloor, memoryCap);
   }
 
   int _persistUndoLimit() {
     final int frameBytes = _rawWidth * _rawHeight * 4;
     if (frameBytes <= 0) {
-      return _minUndoSteps;
+      return _minUndoStepsFloor;
     }
     return (_persistUndoBudgetBytes ~/ frameBytes).clamp(
-      _minUndoSteps,
+      _minUndoStepsFloor,
       _persistUndoHardLimit,
     );
   }
@@ -1776,7 +2434,7 @@ class BasicScreenController extends ChangeNotifier {
     if (frameBytes <= 0) return;
 
     final int undoByMemory = (_undoBudgetBytes ~/ frameBytes).clamp(
-      _minUndoSteps,
+      _minUndoStepsFloor,
       _maxUndoStepsHard,
     );
     if (_targetUndoSteps > undoByMemory) {
@@ -1787,7 +2445,7 @@ class BasicScreenController extends ChangeNotifier {
     }
 
     final int timelapseByMemory = (_timelapseBudgetBytes ~/ frameBytes).clamp(
-      _minTimelapseFrames,
+      _minTimelapseFramesFloor,
       _maxTimelapseFramesHard,
     );
     final List<Uint8List> evictedFrames = _timelapse.setMaxFrames(
@@ -2223,11 +2881,35 @@ class BasicScreenController extends ChangeNotifier {
     return frames;
   }
 
-  Future<ui.Image> _decodeToUiImage(Uint8List bytes) async {
-    final ui.Codec codec = await ui.instantiateImageCodec(bytes);
+  Future<({ui.Image image, int rawWidth, int rawHeight})> _decodePreviewImage(
+    Uint8List bytes,
+  ) async {
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      bytes,
+    );
+    final ui.ImageDescriptor descriptor = await ui.ImageDescriptor.encoded(
+      buffer,
+    );
+    final int rawWidth = descriptor.width;
+    final int rawHeight = descriptor.height;
+    final ({int width, int height}) scaled = _scaledImageDimensions(
+      width: rawWidth,
+      height: rawHeight,
+      maxDimension: _maxCanvasUiDimension,
+    );
+    final ui.Codec codec = await descriptor.instantiateCodec(
+      targetWidth: scaled.width,
+      targetHeight: scaled.height,
+    );
     final ui.FrameInfo frame = await codec.getNextFrame();
     codec.dispose();
-    return frame.image;
+    descriptor.dispose();
+    buffer.dispose();
+    return (
+      image: frame.image,
+      rawWidth: rawWidth,
+      rawHeight: rawHeight,
+    );
   }
 
   Future<ui.Image> _rawRgbaToUiImage(
@@ -2244,12 +2926,41 @@ class BasicScreenController extends ChangeNotifier {
       height: height,
       pixelFormat: ui.PixelFormat.rgba8888,
     );
-    final ui.Codec codec = await descriptor.instantiateCodec();
+    final ({int width, int height}) scaled = _scaledImageDimensions(
+      width: width,
+      height: height,
+      maxDimension: _maxCanvasUiDimension,
+    );
+    final ui.Codec codec = await descriptor.instantiateCodec(
+      targetWidth: scaled.width,
+      targetHeight: scaled.height,
+    );
     final ui.FrameInfo frame = await codec.getNextFrame();
     codec.dispose();
     descriptor.dispose();
     buffer.dispose();
     return frame.image;
+  }
+
+  static ({int width, int height}) _scaledImageDimensions({
+    required int width,
+    required int height,
+    required int maxDimension,
+  }) {
+    if (width <= 0 || height <= 0 || maxDimension <= 0) {
+      return (width: width, height: height);
+    }
+    final int longestSide = math.max(width, height);
+    if (longestSide <= maxDimension) {
+      return (width: width, height: height);
+    }
+    final double scale = maxDimension / longestSide;
+    final int scaledWidth = math.max(1, (width * scale).round());
+    final int scaledHeight = math.max(1, (height * scale).round());
+    return (
+      width: scaledWidth,
+      height: scaledHeight,
+    );
   }
 
   void _updateFitCache() {
@@ -2281,6 +2992,7 @@ class BasicScreenController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _clearBrushConstraintState();
     _timelapse.stop();
     _autosaveTimer?.cancel();
     _messageTimer?.cancel();

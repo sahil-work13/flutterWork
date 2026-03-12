@@ -24,6 +24,7 @@ class PaintTimelapsePlayer extends StatefulWidget {
 }
 
 class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
+  static const int _maxRenderedFrameDimension = 1280;
   static const List<double> _speedOptions = <double>[
     0.25,
     0.5,
@@ -256,12 +257,38 @@ class _PaintTimelapsePlayerState extends State<PaintTimelapsePlayer> {
       height: height,
       pixelFormat: ui.PixelFormat.rgba8888,
     );
-    final ui.Codec codec = await descriptor.instantiateCodec();
+    final ({int width, int height}) scaled = _scaledFrameDimensions(
+      width: width,
+      height: height,
+    );
+    final ui.Codec codec = await descriptor.instantiateCodec(
+      targetWidth: scaled.width,
+      targetHeight: scaled.height,
+    );
     final ui.FrameInfo frame = await codec.getNextFrame();
     codec.dispose();
     descriptor.dispose();
     buffer.dispose();
     return frame.image;
+  }
+
+  static ({int width, int height}) _scaledFrameDimensions({
+    required int width,
+    required int height,
+  }) {
+    final int longestSide = width > height ? width : height;
+    if (width <= 0 ||
+        height <= 0 ||
+        longestSide <= _maxRenderedFrameDimension) {
+      return (width: width, height: height);
+    }
+    final double scale = _maxRenderedFrameDimension / longestSide;
+    final int scaledWidth = (width * scale).round();
+    final int scaledHeight = (height * scale).round();
+    return (
+      width: scaledWidth < 1 ? 1 : scaledWidth,
+      height: scaledHeight < 1 ? 1 : scaledHeight,
+    );
   }
 
   void _replaceCurrentImage(ui.Image? nextImage) {
@@ -488,12 +515,25 @@ class _RoundIconButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return IconButton(
       onPressed: onPressed,
-      style: IconButton.styleFrom(
-        fixedSize: const Size(38, 38),
-        backgroundColor: onPressed == null
-            ? Colors.white.withValues(alpha: 0.08)
-            : Colors.white.withValues(alpha: 0.12),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+      style: ButtonStyle(
+        fixedSize: const WidgetStatePropertyAll<Size>(Size(38, 38)),
+        backgroundColor: WidgetStateProperty.resolveWith<Color?>(
+          (Set<WidgetState> states) {
+            if (states.contains(WidgetState.disabled)) {
+              return Colors.white.withValues(alpha: 0.08);
+            }
+            if (states.contains(WidgetState.pressed)) {
+              return Colors.white.withValues(alpha: 0.24);
+            }
+            return Colors.white.withValues(alpha: 0.12);
+          },
+        ),
+        overlayColor: WidgetStatePropertyAll<Color?>(
+          Colors.white.withValues(alpha: 0.10),
+        ),
+        shape: WidgetStatePropertyAll<OutlinedBorder>(
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+        ),
       ),
       icon: Icon(
         icon,
@@ -733,6 +773,8 @@ class _ControlButton extends StatelessWidget {
         child: InkWell(
           onTap: onPressed,
           borderRadius: BorderRadius.circular(14),
+          splashColor: Colors.white.withValues(alpha: 0.14),
+          highlightColor: Colors.white.withValues(alpha: 0.10),
           child: SizedBox(
             width: 44,
             height: 44,
@@ -780,28 +822,35 @@ class _PlayButton extends StatelessWidget {
 
     return Opacity(
       opacity: enabled ? 1.0 : 0.45,
-      child: GestureDetector(
-        onTap: enabled ? onPressed : null,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 180),
-          width: 60,
-          height: 60,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            gradient: const LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: <Color>[
-                Color(0xFF6C63FF),
-                Color(0xFFA78BFA),
-              ],
+      child: Material(
+        color: Colors.transparent,
+        shape: const CircleBorder(),
+        child: InkWell(
+          onTap: enabled ? onPressed : null,
+          customBorder: const CircleBorder(),
+          splashColor: Colors.white.withValues(alpha: 0.18),
+          highlightColor: Colors.white.withValues(alpha: 0.12),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            width: 60,
+            height: 60,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: <Color>[
+                  Color(0xFF6C63FF),
+                  Color(0xFFA78BFA),
+                ],
+              ),
+              boxShadow: shadows,
             ),
-            boxShadow: shadows,
-          ),
-          child: Icon(
-            isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-            color: Colors.white,
-            size: 32,
+            child: Icon(
+              isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+              color: Colors.white,
+              size: 32,
+            ),
           ),
         ),
       ),
@@ -825,6 +874,8 @@ class _SpeedPill extends StatelessWidget {
         child: InkWell(
           onTap: onPressed,
           borderRadius: BorderRadius.circular(999),
+          splashColor: Colors.white.withValues(alpha: 0.14),
+          highlightColor: Colors.white.withValues(alpha: 0.10),
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
             decoration: BoxDecoration(

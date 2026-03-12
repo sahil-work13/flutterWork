@@ -7,6 +7,7 @@ import 'paint_loader.dart';
 class PaintCanvasContainer extends StatefulWidget {
   const PaintCanvasContainer({
     super.key,
+    required this.repaintBoundaryKey,
     required this.image,
     required this.imageWidth,
     required this.imageHeight,
@@ -19,6 +20,7 @@ class PaintCanvasContainer extends StatefulWidget {
     required this.onViewportSizeChanged,
   });
 
+  final GlobalKey repaintBoundaryKey;
   final ui.Image? image;
   final int imageWidth;
   final int imageHeight;
@@ -66,32 +68,35 @@ class _PaintCanvasContainerState extends State<PaintCanvasContainer> {
           }
 
           return Center(
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 240),
-              curve: Curves.easeOutCubic,
-              width: canvasWidth,
-              height: canvasHeight,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: <BoxShadow>[
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.35),
-                    blurRadius: 40,
-                    offset: const Offset(0, 18),
-                  ),
-                ],
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(20),
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: <Widget>[
-                    _buildCanvasContent(canvasWidth, canvasHeight),
-                    PaintImageTransitionLoader(
-                      visible: widget.showImageTransitionLoader,
+            child: RepaintBoundary(
+              key: widget.repaintBoundaryKey,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 240),
+                curve: Curves.easeOutCubic,
+                width: canvasWidth,
+                height: canvasHeight,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: <BoxShadow>[
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.35),
+                      blurRadius: 40,
+                      offset: const Offset(0, 18),
                     ),
                   ],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: <Widget>[
+                      _buildCanvasContent(canvasWidth, canvasHeight),
+                      PaintImageTransitionLoader(
+                        visible: widget.showImageTransitionLoader,
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),

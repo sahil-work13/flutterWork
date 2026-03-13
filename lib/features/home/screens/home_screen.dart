@@ -9,6 +9,8 @@ import 'package:flutterwork/features/home/widgets/categories_section.dart';
 import 'package:flutterwork/features/home/widgets/daily_challenge_card.dart';
 import 'package:flutterwork/features/home/widgets/featured_section.dart';
 import 'package:flutterwork/features/home/widgets/greeting_header.dart';
+import 'package:flutterwork/features/home/widgets/darw_canvas_card.dart';
+import 'package:flutterwork/features/sketching/screens/sketching_screen.dart';
 import 'package:flutterwork/features/home/widgets/trending_section.dart';
 import 'package:flutterwork/features/paint/screens/basic_screen.dart';
 
@@ -108,6 +110,12 @@ class _HomeScreenState extends State<HomeScreen> {
                     imagePath: dailyChallengeItem.imagePath,
                     onStartTap: () =>
                         _openPainter(dailyChallengeItem.imagePath),
+                  ),
+                  const SizedBox(height: 16),
+                  DrawCanvasCard(
+                    title: 'Sketching',
+                    subtitle: 'Pencil | Symmetry | Shapes | Grid',
+                    onTap: _openSketching,
                   ),
                   const SizedBox(height: 16),
                   _buildLevelCard(),
@@ -231,6 +239,15 @@ class _HomeScreenState extends State<HomeScreen> {
       context,
       MaterialPageRoute<void>(
         builder: (_) => BasicScreen(imagePath: selectedImage),
+      ),
+    );
+  }
+
+  void _openSketching() {
+    Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => const SketchingScreen(),
       ),
     );
   }
